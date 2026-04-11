@@ -1,0 +1,39 @@
+{
+    "app": {
+        "debug": true
+    },
+    "comm": {
+        "hex_string": false
+    },
+    "serial": {
+        "com": "COM2",
+        "baud": 115200
+    },
+    "influx": {
+        "no_db": true,
+        "host": "localhost",
+        "port": 8086,
+        "token": "2EDnxUyx8TEwVS3LOqUUt3-GVYfkVa8mNCZ9jToemwVEQM4BXxKxfmEHmoNAnFVvQ9r67EHbctLnQLGHXEaRpg==",
+        "db_name": "SER",
+        "org": "SER",
+        "bucket": "SER"
+    },
+    "CAN": {
+        "MPPT": {
+            "base_addr": "0x600",
+            "mppt1_id": "0x600"
+        },
+        "BMS": {
+            "base_addr": "0x700"
+        },
+        "AC": {
+            "base_addr": "0x630"
+        },
+        "DC": {
+            "base_addr": "0x660"
+        },
+        "MC": {
+            "base_addr": "0x500"
+        }
+    }
+}
