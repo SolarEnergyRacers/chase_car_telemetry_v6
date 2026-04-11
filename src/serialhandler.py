@@ -25,15 +25,16 @@ class SerialHandler(QtCore.QThread):
     def run(self):
         while True:
             try:
-                if self.com_available and self._com.inWaiting() > 0:
-                    input_val = self._com.read_until()
-                    lg.debug(f"Serial input: {input_val} length: {len(input_val)}")
-                    if self.opt["comm"]["hex_string"]:
-                        self.handle_input_hex(input_val)
-                    else:
-                        self.handle_input_bytes(input_val)
+                if self.com_available:
+                    input_val = self._com.read(11)
+                    if self._com.inWaiting() > 0:
+                        lg.debug(f"Serial input: {input_val} length: {len(input_val)}")
+                        if self.opt["comm"]["hex_string"]:
+                            self.handle_input_hex(input_val)
+                        else:
+                            self.handle_input_bytes(input_val)
 
-                elif not self.com_available:
+                else:
                     self._connect_serial()
                     self.usleep(int(1 * 10e5)) # wait one second before trying to reconnect to serial port
 
@@ -88,7 +89,7 @@ class SerialHandler(QtCore.QThread):
 
     def _connect_serial(self):
         try:
-            lg.info("Trying to open Serial...")
+            lg.info(f"Trying to open Serial {self.opt["serial"]["com"]} at {self.opt["serial"]["baud"]} ...")
             self._com = serial.Serial(self.opt["serial"]["com"], self.opt["serial"]["baud"])
             self._com.timeout = 1
             self.com_available = True

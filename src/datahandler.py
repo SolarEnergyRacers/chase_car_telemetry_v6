@@ -1,7 +1,7 @@
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import QObject
 
-from influxdb_client import InfluxDBClient, Point, WritePrecision
+# from influxdb_client import InfluxDBClient, Point, WritePrecision
 import requests
 import logging as lg
 
