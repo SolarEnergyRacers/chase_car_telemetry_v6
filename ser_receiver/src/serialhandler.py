@@ -25,18 +25,19 @@ class SerialHandler(QtCore.QThread):
     def run(self):
         while True:
             try:
-                if self.com_available:
-                    input_val = self._com.read(11)
-                    if self._com.inWaiting() > 0:
-                        lg.debug(f"Serial input: {input_val} length: {len(input_val)}")
-                        if self.opt["comm"]["hex_string"]:
-                            self.handle_input_hex(input_val)
-                        else:
-                            self.handle_input_bytes(input_val)
-
-                else:
+                if not self.com_available:
                     self._connect_serial()
-                    self.usleep(int(1 * 10e5)) # wait one second before trying to reconnect to serial port
+                    self.usleep(int(1 * 10e5)) 
+                    # wait one second before trying to reconnect to serial port
+                    continue
+
+                input_val = self._com.read(11)  # 1 entry at a time
+                if input_val:
+                    lg.debug(f"Serial input: [{input_val.hex(" ")}] length: {len(input_val)}")
+                    if self.opt["comm"]["hex_string"]:
+                        self.handle_input_hex(input_val)
+                    else:
+                        self.handle_input_bytes(input_val)
 
             except serial.SerialException:
                 self._com.close()
@@ -63,23 +64,50 @@ class SerialHandler(QtCore.QThread):
         if self.com_available:
             self._com.write(out_message.encode("ascii", "ignore"))
 
+    expect_invalid = 0
+    lost_bytes = bytearray()
+    # ^ bytes following a missed start charcter that are thus unparsable.
+    # Accumulated for logging.
     def handle_input_bytes(self, input_val):
-
-        if input_val[0] >= 0xF8 and len(input_val) == 11:
-            self.new_input.emit(input_val)
-            self.buffer = bytearray()
-        elif len(input_val) < 11:
-            if len(self.buffer) + len(input_val) == 11 and input_val[-1] == 13: #13 is \n (LF), maybe change to 10 (CR)
-                self.new_input.emit(self.buffer + input_val)
-                self.buffer = bytearray()
-            elif len(self.buffer) + len(input_val) < 11 and len(self.buffer) > 0:
-                self.buffer += input_val
-            elif len(self.buffer) == 0 and input_val[0] >= 0xF8:
-                self.buffer = input_val
+        # Rolling buffer; ideally handling one whole 11-Byte line at a time, 
+        # but buffer partial and process as long as available before returning.
+        # expect missing characters - bitflips are handled on link-layer (I hope)
+        self.buffer += input_val
+        idx = 0
+        while idx < len(self.buffer) - 10:
+            if self.buffer[idx] >= 0xF8:
+                if self.lost_bytes:
+                    lg.warning(f"received unparsable data: [{self.lost_bytes.hex(" ")}]")
+                self.lost_bytes = bytearray()
+                if self.buffer[idx+10] == ord('\n'):
+                    # assume string starting with valid address and ending
+                    # on \n is a proper package, no further check possible.
+                    self.new_input.emit(self.buffer[idx:idx+11])
+                    self.expect_invalid = 0
+                    idx += 11
+                    continue
+                else:
+                    lg.warning(f"received invalid package: [{self.buffer[idx:idx+11].hex(" ")}]")
+                    self.expect_invalid = idx+10  # silence already logged bytes
+                    idx += 1
+                    continue
             else:
-                lg.warning(f"A. Couldn't handle partial input {input_val}")
-        else:
-            lg.warning(f"B. Couldn't handle partial input {input_val}")
+                if idx > self.expect_invalid:
+                    self.lost_bytes += self.buffer[idx].to_bytes(1)
+                idx += 1
+        self.buffer = self.buffer[idx:]
+        self.expect_invalid -= idx
+        lg.debug(f"truncated buffer to {self.buffer} (lost counter = {self.lost_bytes})")
+
+        # safeguard against memory leak (should not happen during legitimate connection)
+        if len(self.buffer) > 1024:
+            lg.error(f"received only garbage data for 100+ lines straight, discarding data - radio connection dead?")
+            lg.debug(f"discarded garbage data: [{self.buffer[:-11].hex(" ")}]")
+            self.buffer = self.buffer[-11:]
+        if len(self.lost_bytes) > 1024:
+            lg.error(f"received only garbage data for 100+ lines straight, discarding data - radio connection dead?")
+            lg.debug(f"discarded garbage data: [{self.lost_bytes.hex(" ")}]")
+            self.lost_bytes = bytearray()
 
     #not used
     def handle_input_hex(self, input_val):
