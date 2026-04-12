@@ -1,0 +1,16 @@
+{
+    "app": {
+        "debug": true
+    },
+    "comm": {
+        "hex_string": false
+    },
+    "serial": {
+        "com": "/dev/pts/8"
+    },
+    "CAN": {
+        "fake_time": {
+            "base_addr": "0x111"
+        }
+    }
+}

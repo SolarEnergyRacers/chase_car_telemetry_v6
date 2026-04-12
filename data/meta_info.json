@@ -1,0 +1,23 @@
+{
+    "meta_info": [
+        "info about how file is to be interpreted.",
+        "keys: 'sep'. 'cols' for separating character and column info",
+        "sep is assumed ';' if none given. ",
+        "timestamp column is contains datetime.strptime format info and",
+        "an UTF timestamp to be understood as global offset to first entry."
+    ],
+    "2024-09-21_05-33-10_ser_comm.csv": {
+        "sep": ";",
+        "cols": [
+            ["timestamp", "%H:%M:%S.%f", 1726876800],
+            ["canframe"],
+            ["meta_addr"]
+        ]
+    },
+    "2024-09-21_06-21-18_ser_comm.csv": {
+        "cols": [
+            ["timestamp", "%H:%M:%S.%f", 1726876800],
+            ["canframe"]
+        ]
+    }
+}
