@@ -130,3 +130,23 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+
+# communication logfiles -> exclude, except during race
+*_ser_comm.csv
+# 1 week before
+!2026-09-03_*_ser_comm.csv
+!2026-09-04_*_ser_comm.csv
+!2026-09-05_*_ser_comm.csv
+!2026-09-06_*_ser_comm.csv
+!2026-09-07_*_ser_comm.csv
+!2026-09-08_*_ser_comm.csv
+!2026-09-09_*_ser_comm.csv
+# race
+!2026-09-10_*_ser_comm.csv
+!2026-09-11_*_ser_comm.csv
+!2026-09-12_*_ser_comm.csv
+!2026-09-13_*_ser_comm.csv
+!2026-09-14_*_ser_comm.csv
+!2026-09-15_*_ser_comm.csv
+!2026-09-16_*_ser_comm.csv
