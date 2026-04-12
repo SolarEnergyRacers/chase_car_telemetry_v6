@@ -96,9 +96,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_mainWindow):
     def update_cell_info(self, data: list[DataPoint]):
         for dp in data:
             if dp.measurement == "min_voltage":
-                self.lcdMinVoltage.display(dp.fields["value"])
+                self.lcdMinVoltage.display(f"{dp.fields["value"]:7.3f}")
             elif dp.measurement == "max_voltage":
-                self.lcdMaxVoltage.display(dp.fields["value"])
+                self.lcdMaxVoltage.display(f"{dp.fields["value"]:7.3f}")
 
     def update_errors(self, data: list[DataPoint]):
         self.lstErrors.clear()

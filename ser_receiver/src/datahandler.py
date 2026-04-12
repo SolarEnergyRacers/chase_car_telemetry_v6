@@ -1,12 +1,37 @@
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import QObject
 
+import threading
+import queue
+from multiprocessing.connection import Listener
+
 # from influxdb_client import InfluxDBClient, Point, WritePrecision
 import requests
 import logging as lg
 
 from datainput import DataInput, CANFrame
 from datapoint import DataPoint
+
+
+def panda_socket(panda_queue: queue.Queue):
+    # basic implementation for 1 outgoing connection
+    listener = Listener(('localhost', 6000), authkey=b"otp tbd")
+    running = True
+    while running:
+        conn = listener.accept()
+        while True:
+            item = panda_queue.get()
+            try:
+                conn.send(item)
+            except BrokenPipeError:
+                lg.warn("panda pipe broken; attempt to reconnect")
+                break
+            except KeyboardInterrupt:
+                lg.info("intercepted KeyboardInterrupt, closing panda pipe")
+                conn.close()
+                running = 0
+                break
+
 
 # Inherits QObject so it can emit signals
 class DataHandler(QObject):
@@ -24,19 +49,13 @@ class DataHandler(QObject):
         self.opt = opt
 
         try:
-            if not self.opt["influx"]["no_db"]:
-                self.client = InfluxDBClient(url="http://"+opt["influx"]["host"]+":"+str(opt["influx"]["port"]),
-                                             token=opt["influx"]["token"],
-                                             org=opt["influx"]["org"])
-                self.write_api = self.client.write_api()
-                self.available = True
+            self.panda_queue = queue.Queue()
+            t = threading.Thread(target=panda_socket, args=(self.panda_queue,), daemon=True)
+            t.start()
 
-        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout, ConnectionRefusedError) as err:
-            self.available = False
+        except Exception as err:
             lg.error(err)
-            lg.error("Connection to Influx DB failed")
-            lg.error("host=" + opt["influx"]["host"])
-            lg.error("port=" + str(opt["influx"]["port"]))
+            lg.error("Panda socket creation failed.")
 
     def handle_new_input(self, input_val):
         di = CANFrame(self.opt, input_val)
