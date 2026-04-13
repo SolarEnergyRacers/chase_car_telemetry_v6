@@ -34,6 +34,10 @@
         },
         "MC": {
             "base_addr": "0x500"
+        },
+        "debug_timestamp":{
+            "base_addr": "0x111",
+            "enable": true
         }
     }
 }

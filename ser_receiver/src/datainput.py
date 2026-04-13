@@ -4,6 +4,13 @@ import time
 import logging as lg
 from datapoint import DataPoint
 
+fake_time = 0
+def get_timestamp(opt: dict):
+    global fake_time
+    if opt["CAN"]["debug_timestamp"]["enable"]:
+        return fake_time
+    return int(time.time())
+
 # Use as abstract class
 class DataInput:
     def __init__(self):
@@ -24,7 +31,7 @@ class CANFrame(DataInput):
     def __init__(self, opt: dict, serial_bytes):
         DataInput.__init__(self)
         self.opt = opt
-        self.timestamp = int(time.time())
+        self.timestamp = get_timestamp(opt)
         self.serial_bytes = serial_bytes
 
         if opt["comm"]["hex_string"]:
@@ -75,10 +82,20 @@ class CANFrame(DataInput):
     def isMCFrame(self):
         return int(self.opt["CAN"]["MC"]["base_addr"], 16) == (self.addr & 0xF00)
 
+    def isDebugTimestamp(self):
+        return (
+            self.opt["CAN"]["debug_timestamp"]["enable"] 
+            and int(self.opt["CAN"]["debug_timestamp"]["base_addr"], 16) == (self.addr & 0xFFF)
+        )
+
     def asDatapoints(self):
         datapoints = []
 
-        if self.isBMSFrame():
+        if self.isDebugTimestamp():
+            global fake_time
+            fake_time = self.get_data_i(64, True, 0, False) // 1000
+
+        elif self.isBMSFrame():
             bms_baseaddr = int(self.opt["CAN"]["BMS"]["base_addr"], 16)
             if self.addr == bms_baseaddr:  # BMU Heartbeat/Serialnumber
                 datapoints.append(DataPoint(
@@ -492,8 +509,7 @@ class CANFrame(DataInput):
         else:  # Prob. transmission error or wrong addresses configured
             lg.warning("Couldn't assign CAN Frame from: " + hex(self.addr))
 
-        lg.debug("DATAPOINTS:")
-        lg.debug(datapoints)
+        lg.debug(f"asDatapoints() -> {datapoints}")
 
 
         return datapoints

@@ -3,6 +3,7 @@ from PyQt5.QtCore import pyqtSlot
 
 import logging as lg
 from datetime import datetime
+from pathlib import Path
 
 from datapoint import DataPoint
 from ui_mainwindow import Ui_mainWindow
@@ -15,7 +16,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_mainWindow):
         self.setupUi(self)
 
         log_file_name = datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S') + "_ser_comm.csv"
-        self.log_file = open(log_file_name, 'w+')
+        log_file_path = Path(__file__).parent.parent.parent / "data" / log_file_name
+        self.log_file = open(log_file_path, 'w+')
+        lg.info(f"writing log to '{log_file_path}'")
 
         self.btnSend.clicked.connect(self.on_click_send)
         self.leditInput.returnPressed.connect(self.on_click_send)
@@ -71,13 +74,15 @@ class MainWindow(QtWidgets.QMainWindow, Ui_mainWindow):
     def handle_new_input(self, data):
         lg.debug(f'gui received: {data.hex(" ")}')
 
-        curr_time = datetime.utcnow().strftime('%H:%M:%S.%f')[:-3]
+        curr_time = datetime.utcnow()
+        curr_time_s = curr_time.strftime('%H:%M:%S.%f')[:-3]
+        curr_time_l = curr_time.strftime('%Y-%m-%d_%H:%M:%S.%f')[:-3]
         addr = int.from_bytes(data[0:2], 'big') & 0x7FF
 
-        self.plainTextEdit.appendPlainText(f'{curr_time} << {data.hex(" ")} addr: {hex(addr)}')
+        self.plainTextEdit.appendPlainText(f'{curr_time_s} << {data.hex(" ")} addr: {hex(addr)}')
 
         try:
-            self.log_file.write(f'{curr_time};{data.hex(" ")};{hex(addr)}\n')
+            self.log_file.write(f'{curr_time_l};{data.hex(" ")};{hex(addr)}\n')
         except:
             lg.error("Couldn't write to logfile!")
 
