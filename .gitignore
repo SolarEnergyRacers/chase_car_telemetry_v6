@@ -131,6 +131,10 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+# zmq curve keypairs
+*.key
+*.key_secret
+
 
 # communication logfiles -> exclude, except during race
 *_ser_comm.csv

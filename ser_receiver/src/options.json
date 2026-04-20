@@ -18,6 +18,11 @@
         "org": "SER",
         "bucket": "SER"
     },
+    "server": {
+        "host": "localhost",
+        "port": 8086,
+        "keyname": "certificate"
+    },
     "CAN": {
         "MPPT": {
             "base_addr": "0x600",
