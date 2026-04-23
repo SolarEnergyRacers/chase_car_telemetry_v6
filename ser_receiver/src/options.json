@@ -6,7 +6,7 @@
         "hex_string": false
     },
     "serial": {
-        "com": "/dev/pts/5",
+        "com": "/dev/pts/4",
         "baud": 115200
     },
     "influx": {
@@ -20,7 +20,8 @@
     },
     "server": {
         "host": "localhost",
-        "port": 8086,
+        "port_pub": 8086,
+        "port_rep": 8087,
         "keyname": "certificate"
     },
     "CAN": {

@@ -11,27 +11,10 @@ import logging as lg
 
 from datainput import DataInput, CANFrame
 from datapoint import DataPoint
+from panda_server import Panda_server
 
 
-def panda_socket(panda_queue: queue.Queue):
-    # basic implementation for 1 outgoing connection
-    listener = Listener(('localhost', 6000), authkey=b"otp tbd")
-    running = True
-    while running:
-        conn = listener.accept()
-        while True:
-            item = panda_queue.get()
-            try:
-                conn.send(item)
-            except BrokenPipeError:
-                lg.warn("panda pipe broken; attempt to reconnect")
-                break
-            except KeyboardInterrupt:
-                lg.info("intercepted KeyboardInterrupt, closing panda pipe")
-                conn.close()
-                running = 0
-                break
-
+x = 0  # responder demo counter
 
 # Inherits QObject so it can emit signals
 class DataHandler(QObject):
@@ -49,13 +32,22 @@ class DataHandler(QObject):
         self.opt = opt
 
         try:
-            self.panda_queue = queue.Queue()
-            t = threading.Thread(target=panda_socket, args=(self.panda_queue,), daemon=True)
-            t.start()
+            self.panda_queue = queue.Queue(maxsize=1024)  # arbitrary maxsize, just prevent memory leak if stalled
+            self.fullQ_err_logged = 0
+            def demo_response(timestamps: dict):
+                global x
+                answer = {"timestamps": timestamps, "data": (x := x+1)}
+                print(f"demo response for {timestamps} is {answer}")
+                return answer
+            self.server = Panda_server(opt, demo_response)
+
 
         except Exception as err:
             lg.error(err)
             lg.error("Panda socket creation failed.")
+    
+    def shutdown_panda(self):
+        return self.server.shutdown()
 
     def handle_new_input(self, input_val):
         di = CANFrame(self.opt, input_val)
@@ -70,17 +62,7 @@ class DataHandler(QObject):
 
         for dp in datapoints:
             lg.debug(dp.__dict__)
-            if not self.opt["influx"]["no_db"]:
-                #self.write_api.write(bucket=self.opt["influx"]["bucket"], org=self.opt["influx"]["org"], record = dp.__dict__)
-
-                p = Point(dp.measurement).field("value", dp.fields["value"])
-
-                for tag in dp.tags:
-                    p = p.tag(tag, dp.tags[tag])
-
-                self.write_api.write(bucket=self.opt["influx"]["bucket"], org=self.opt["influx"]["org"],  record=p)
-
-
+            self.server.publish(dp.__dict__)
             if dp.measurement == "speed":
                 self.recSpeedInfo.emit(dp)
             elif dp.measurement == "batt_volt":

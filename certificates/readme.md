@@ -13,3 +13,5 @@ Consequently, annoying key handling has to be done manually:
 
 - The public key from ./mine/ must be distributed among all the devices that should be able to conncet to it.
 Vice versa, the public keys of all trusted devices must be made available in ./others/.
+
+- This includes copying the public key from ./mine/ into ./others/ if data analysis is running on localhost. (Not done automatically due to potential name conflicts in ./others/)

@@ -42,7 +42,9 @@ if __name__ == "__main__":
 
     mw.show()
     sh.start()
-    sys.exit(app.exec_())
+    ret = app.exec_()
+    dh.shutdown_panda()
+    sys.exit(ret)
 
 
 
