@@ -9,17 +9,8 @@
         "com": "/dev/pts/4",
         "baud": 115200
     },
-    "influx": {
-        "no_db": true,
-        "host": "localhost",
-        "port": 8086,
-        "token": "2EDnxUyx8TEwVS3LOqUUt3-GVYfkVa8mNCZ9jToemwVEQM4BXxKxfmEHmoNAnFVvQ9r67EHbctLnQLGHXEaRpg==",
-        "db_name": "SER",
-        "org": "SER",
-        "bucket": "SER"
-    },
     "server": {
-        "host": "localhost",
+        "host": "0.0.0.0",
         "port_pub": 8086,
         "port_rep": 8087,
         "keyname": "certificate"

@@ -154,3 +154,22 @@ dmypy.json
 !2026-09-14_*_ser_comm.csv
 !2026-09-15_*_ser_comm.csv
 !2026-09-16_*_ser_comm.csv
+
+# datapoint csv files -> exclude, except during race
+data/datapoints/data_*.csv
+# 1 week before
+!data_2026-09-03_*.csv
+!data_2026-09-04_*.csv
+!data_2026-09-05_*.csv
+!data_2026-09-06_*.csv
+!data_2026-09-07_*.csv
+!data_2026-09-08_*.csv
+!data_2026-09-09_*.csv
+# race
+!data_2026-09-10_*.csv
+!data_2026-09-11_*.csv
+!data_2026-09-12_*.csv
+!data_2026-09-13_*.csv
+!data_2026-09-14_*.csv
+!data_2026-09-15_*.csv
+!data_2026-09-16_*.csv
