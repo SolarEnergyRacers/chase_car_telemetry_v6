@@ -9,7 +9,7 @@ def get_timestamp(opt: dict):
     global fake_time
     if opt["CAN"]["debug_timestamp"]["enable"]:
         return fake_time
-    return int(time.time())
+    return int(time.time()*1000)
 
 # Use as abstract class
 class DataInput:
@@ -93,7 +93,7 @@ class CANFrame(DataInput):
 
         if self.isDebugTimestamp():
             global fake_time
-            fake_time = self.get_data_i(64, True, 0, False) // 1000
+            fake_time = self.get_data_i(64, True, 0, False)
 
         elif self.isBMSFrame():
             bms_baseaddr = int(self.opt["CAN"]["BMS"]["base_addr"], 16)

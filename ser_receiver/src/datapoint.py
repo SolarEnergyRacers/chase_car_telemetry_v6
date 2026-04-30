@@ -5,5 +5,5 @@ from typing import Any, Dict
 class DataPoint:
     measurement: str
     tags: Dict
-    time: int
+    time: int  # timestamp in ms
     fields: Dict

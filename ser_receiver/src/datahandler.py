@@ -139,7 +139,7 @@ class DataHandler(QObject):
         """wrapper for write_csv that sets file name based on timestamp of dp,
         then replaces write_csv() with the proper, unwrapped call.
         """
-        now = dp.time
+        now = dp.time / 1000.
         now = datetime.fromtimestamp(now).strftime("%Y-%m-%d_%H")
         lg.debug(f"setup csv fake time: {dp.time} -> {now}.")
 

@@ -10,6 +10,7 @@ import zmq.auth
 
 class Panda_client:
     def __init__(self, opt: dict, panda_pipe: queue.Queue):
+        print("made new panda :3")
         self.queue = panda_pipe
         keyname = opt['client']['keyname']
         serv_keyname = opt['server']['keyname']
@@ -66,7 +67,7 @@ class Panda_client:
                 poller.register(client, zmq.POLLIN)
                 lg.info(f"panda client subscriber online on {self.url_pub}")
                 while self.subscriber_online:
-                    events = dict(poller.poll(timeout = 1.0))
+                    events = dict(poller.poll(timeout = 1e3))
                     if client in events:
                         rx = client.recv_json() # todo: clean exit see server?
                         if not self.queue.full():
@@ -87,8 +88,29 @@ class Panda_client:
         """request all data from start to stop time (unix timestamps)"""
         if self.requester is None:
             raise RuntimeError("No requester service is running")
-        self.requester.send_json({"start_t": start_t, "stop_t": stop_t})
-        return self.requester.recv_json()
+        try:
+            self.requester.send_json({"start_t": start_t, "stop_t": stop_t})
+            poller = zmq.Poller()
+            poller.register(self.requester, zmq.POLLIN)
+            if self.requester in dict(poller.poll(timeout = 10e3)):
+                return self.requester.recv_json()
+            else:
+                threading.Thread(
+                    target=self.requester.recv_json, 
+                    daemon=True
+                ).start()  # absolutely cursed: 
+                # Need to rx & discard, otherwise ZMQ hangs up
+                raise zmq.error.ZMQError(msg=f"request timed out")
+        except zmq.error.ZMQError as e:
+            return {
+                "metadata": {
+                    "errors": [
+                        "request_datapoints() failed",
+                        f"{type(e)} {e}"
+                    ]
+                }, 
+                "csvstr": ""
+            }
 
     def _requester(self):
         try:

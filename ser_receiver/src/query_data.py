@@ -47,6 +47,8 @@ def data_from_timestamps(ts_dict: dict) -> dict:
         # put info of last timestamp into metadata. Client must follow up
         # with another request if they actually want all the data
 
+        # todo: gzip on csvstr (got 15MB csv down to 1.2MB)
+
         with open(f, 'r') as file:
             lines = file.readlines()
             csvstr += ''.join(lines)

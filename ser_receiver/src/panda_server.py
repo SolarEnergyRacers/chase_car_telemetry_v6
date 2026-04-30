@@ -99,7 +99,7 @@ class Panda_server:
                 poller.register(serv, zmq.POLLIN)
                 lg.info(f"panda server responder online on {self.url_rep}")
                 while self.responder_online:
-                    events = dict(poller.poll(timeout = 1.0))
+                    events = dict(poller.poll(timeout = 1e3))
                     # poll to allow shutdown.
                     # Cleaner: add 2nd (internal) socket for shutdown command
                     if serv in events:

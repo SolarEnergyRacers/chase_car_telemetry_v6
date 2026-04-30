@@ -13,8 +13,8 @@ REPO = Path(__file__).parent.parent.parent
 realtime = 0  # 1 = send data at recorded rate, 0 = send timestamp updates instead
 # ser_data = "2024-09-21_05-33-10_ser_comm.csv"          # playback data (in REPO/data)
 ser_data = "2024-09-21_06-21-18_ser_comm.csv"           # playback data (in REPO/data)
-start_time = datetime.strptime("06:38:15", "%H:%M:%S")  # delta relative to UTF timestamp offset info
-stop_time  = datetime.strptime("06:38:30", "%H:%M:%S")  # delta relative to UTF timestamp offset info
+start_time = datetime.strptime("06:30:15", "%H:%M:%S")  # delta relative to UTF timestamp offset info
+stop_time  = datetime.strptime("09:38:30", "%H:%M:%S")  # delta relative to UTF timestamp offset info
 
 
 def get_metadata(ser_data: str):
@@ -107,6 +107,8 @@ def main():
                 intf.write(b"".join([x.to_bytes(1) for x in ints]))
                 intf.flush()
                 sendcount += 1
+                # if sendcount >= 1:
+                #     break
 
                 before = now
 
