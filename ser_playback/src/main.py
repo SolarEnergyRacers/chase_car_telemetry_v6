@@ -9,6 +9,7 @@ import serial
 import time
 
 REPO = Path(__file__).parent.parent.parent
+
 data_base = REPO / "data"
 if not os.path.exists(data_base):
     raise FileNotFoundError(f"data folder {data_base} not found, please create it and add data and meta data files.")
@@ -16,7 +17,7 @@ meta_info = data_base / "meta_info.json"
 if not os.path.exists(meta_info):
     raise FileNotFoundError(f"meta_info.json not found in {data_base}, please create it and add meta data for playback files.")
 
-options = Path(__file__).parent / "options.json"
+options = Path(__file__).parent / "options.json" 
 if not os.path.exists(options):
     raise FileNotFoundError(f"options.json not found in {REPO}, please create it.")
 
@@ -25,6 +26,7 @@ realtime = 0  # 1 = send data at recorded rate, 0 = send timestamp updates inste
 ser_data = "2024-09-21_06-21-18_ser_comm.csv"           # playback data (in REPO/data)
 start_time = datetime.strptime("06:30:15", "%H:%M:%S")  # delta relative to UTF timestamp offset info
 stop_time  = datetime.strptime("09:38:30", "%H:%M:%S")  # delta relative to UTF timestamp offset info
+
 
 def get_metadata(ser_data: str):
     with open(meta_info, "r") as opt_file:
