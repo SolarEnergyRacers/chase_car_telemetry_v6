@@ -6,7 +6,8 @@
         "hex_string": false
     },
     "serial": {
-        "com": "/dev/pts/4",
+        "Xcom": "/dev/pts/4",
+        "com": "/dev/ttyUSB2",
         "baud": 115200
     },
     "server": {

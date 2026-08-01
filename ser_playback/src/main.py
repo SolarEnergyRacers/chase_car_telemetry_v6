@@ -1,6 +1,7 @@
 
 
 from   datetime import datetime, timedelta
+import os
 from   pathlib import Path
 import json
 import logging as lg
@@ -8,7 +9,16 @@ import serial
 import time
 
 REPO = Path(__file__).parent.parent.parent
+data_base = REPO / "data"
+if not os.path.exists(data_base):
+    raise FileNotFoundError(f"data folder {data_base} not found, please create it and add data and meta data files.")
+meta_info = data_base / "meta_info.json"
+if not os.path.exists(meta_info):
+    raise FileNotFoundError(f"meta_info.json not found in {data_base}, please create it and add meta data for playback files.")
 
+options = Path(__file__).parent / "options.json"
+if not os.path.exists(options):
+    raise FileNotFoundError(f"options.json not found in {REPO}, please create it.")
 
 realtime = 0  # 1 = send data at recorded rate, 0 = send timestamp updates instead
 # ser_data = "2024-09-21_05-33-10_ser_comm.csv"          # playback data (in REPO/data)
@@ -16,9 +26,8 @@ ser_data = "2024-09-21_06-21-18_ser_comm.csv"           # playback data (in REPO
 start_time = datetime.strptime("06:30:15", "%H:%M:%S")  # delta relative to UTF timestamp offset info
 stop_time  = datetime.strptime("09:38:30", "%H:%M:%S")  # delta relative to UTF timestamp offset info
 
-
 def get_metadata(ser_data: str):
-    with open(REPO / "data/meta_info.json", "r") as opt_file:
+    with open(meta_info, "r") as opt_file:
         data_opt = json.load(opt_file)
     if ser_data in data_opt:
         sep = data_opt[ser_data].get("sep", ';')
@@ -41,7 +50,7 @@ def get_metadata(ser_data: str):
 
 def main():
     # read config file
-    with open("options.json", "r") as opt_file:
+    with open(options, "r") as opt_file:
         opt = json.load(opt_file)
 
     # set console logging level
@@ -66,7 +75,7 @@ def main():
     sendcount = 0
     with serial.Serial(opt["serial"]["com"], timeout=0.1) as intf:
         lg.info(f"opened port {opt['serial']['com']}")
-        with open(REPO / "data" / ser_data, 'r') as file:
+        with open(data_base / ser_data, 'r') as file:
             lg.info(f"reading data from {ser_data}")
             firstline = 1
             for line in file.readlines():

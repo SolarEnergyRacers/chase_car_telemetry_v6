@@ -1,6 +1,7 @@
 import json
 
 import logging as lg
+import os
 import sys
 
 from PyQt5 import QtWidgets
@@ -9,11 +10,32 @@ from serialhandler import SerialHandler
 from datahandler import DataHandler
 from mainwindow import MainWindow
 
-if __name__ == "__main__":
+options_file = "options.json"
+if not os.path.exists(options_file):
+    options_file = os.path.join(os.path.dirname(__file__), "..", options_file)
 
+def main():
+    default_opt = {
+        "app": {
+            "debug": False,
+            "baudrate": 115200,
+            "port": "COM3",
+            "timeout": 1,
+        },
+        "data": {
+            "save_path": "./data",
+            "save_interval": 5,
+        },
+    }
     # read config file
-    with open("options.json", "r") as opt_file:
-        opt = json.load(opt_file)
+
+    try:
+        with open(options_file, "r") as opt_file:
+            opt = json.load(opt_file)
+    except FileNotFoundError:
+        print(f"Config file {options_file} not found, creating default config file.")
+        with open(options_file, "w") as opt_file:
+            json.dump(default_opt, opt_file, indent=4)
 
     # set console logging level
     if opt["app"]["debug"]:
@@ -47,4 +69,5 @@ if __name__ == "__main__":
     sys.exit(ret)
 
 
-
+if __name__ == "__main__":
+    main()
