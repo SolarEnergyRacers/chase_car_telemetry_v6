@@ -14,12 +14,12 @@ if __package__ is None:
     import sys
     sys.path.insert(0, str(py_root.parent))
     __package__ = py_root.name + ".roadinfo"
-    print("roadinfo None")
+    # print("roadinfo None")
 elif __package__ == "":
     __package__ = py_root.name + ".roadinfo"
-    print("roadinfo ''")
-print(f"roadinfo {__package__=}")
-print(f"roadinfo {py_root=}")
+    # print("roadinfo ''")
+# print(f"roadinfo {__package__=}")
+# print(f"roadinfo {py_root=}")
 # ~~~ </include dir hack > ~~~
 
 if __name__ == "__main__":

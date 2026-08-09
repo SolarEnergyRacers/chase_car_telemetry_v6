@@ -15,12 +15,12 @@ if __package__ is None:
     import sys
     sys.path.insert(0, str(py_root.parent))
     __package__ = py_root.name + ".roadinfo"
-    print("plot_road None")
+    # print("plot_road None")
 elif __package__ == "":
     __package__ = py_root.name + ".roadinfo"
-    print("plot_road ''")
-print(f"plot_road {__package__=}")
-print(f"plot_road {py_root=}")
+    # print("plot_road ''")
+# print(f"plot_road {__package__=}")
+# print(f"plot_road {py_root=}")
 # ~~~ </include dir hack > ~~~
 
 
