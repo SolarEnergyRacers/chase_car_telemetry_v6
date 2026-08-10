@@ -66,11 +66,17 @@ def plot_road(
     minv = np.nanmin(speeds) if min_speed is None else min_speed
     maxv = np.nanmax(speeds) if max_speed is None else max_speed
 
-    cmap = plt.get_cmap(cmap_name)
-    norm = mcolors.Normalize(vmin=minv, vmax=maxv)
-    sm = cm.ScalarMappable(norm=norm, cmap=cmap)
-    cbar = fig.colorbar(sm, ax=ax)
-    cbar.set_label(cmap_label)
+    if len(ax._colorbars) > 0:
+        # re-use colormap - unfortunately cannot update with new min/max, 
+        # since previous line(s) are already drawn based on original map
+        cbar = ax._colorbars[0]._colorbar
+        cmap = cbar.cmap
+    else:
+        cmap = plt.get_cmap(cmap_name)
+        norm = mcolors.Normalize(vmin=minv, vmax=maxv)
+        sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+        cbar = fig.colorbar(sm, ax=ax)
+        cbar.set_label(cmap_label)
     for xya1, xya2, speed in zip(coords[:-1], coords[1:], speeds[1:]):
         x, y, *a = np.vstack([xya1, xya2]).T
         if np.isnan(speed):
@@ -78,7 +84,7 @@ def plot_road(
             c = '#DDDDDD'
         else:
             ls = "-"
-            c = c = cmap(norm(speed))
+            c = cmap(cbar.norm(speed))
         ax.plot(x, y, color=c, linestyle=ls)
     ax.axis('equal')
 

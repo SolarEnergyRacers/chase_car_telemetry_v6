@@ -22,6 +22,8 @@ elif __package__ == "":
 # print(f"roadinfo {py_root=}")
 # ~~~ </include dir hack > ~~~
 
+from ..geojson.read_geojson import lonlat2angular
+
 if __name__ == "__main__":
     # demo run, see below
     import matplotlib.cm as cm
@@ -136,31 +138,86 @@ def _get_api(geo: dict):
         raise RuntimeError("Expected a LineString")
     coords = geom["coordinates"]
 
-    shape = [{"lat": lat, "lon": lon} for lon, lat, *alt in coords]
+    # valhalla refuses to answer queries longer than 200km
+    # -> divide into N segments, expecting points at ~ regular intervals
+    delta_paths = lonlat2angular(coords)
+    distance = np.sum(delta_paths.T[1])
+    if distance > 195e3:
+        n_split = np.ceil(distance / 150e3).astype(int)
+        n_elem = np.ceil(len(coords) / n_split).astype(int)
+        parts = [coords[i*n_elem :(i + 1)*n_elem] for i in range(n_split)]
+    else:
+        # prefer single-query, if possible
+        parts = [coords]
 
-    payload = {
-        "shape": shape,
-        "costing": "auto",
-        "shape_match": "map_snap"
-    }
+    responses = []
+    for part in parts:
+        shape = [{"lat": lat, "lon": lon} for lon, lat, *alt in part]
 
-    t0 = time.monotonic()
-    r = requests.post(valhalla_url, json=payload)
-    dt = time.monotonic() - t0
-    if r.status_code >= 300:
-        lg.error(f"HTTP code {r.status_code}: {r.text} (after {dt:.3f}sec)")
-    lg.info(f"HTTP {r.status_code} in {dt:.3f}sec")
-    r.raise_for_status()
+        payload = {
+            "shape": shape,
+            "costing": "auto",
+            "shape_match": "map_snap"
+        }
 
-    return r.json()
+        t0 = time.monotonic()
+        r = requests.post(valhalla_url, json=payload)
+        dt = time.monotonic() - t0
+        if r.status_code >= 300:
+            lg.error(f"HTTP code {r.status_code}: {r.text} (after {dt:.3f}sec)")
+        lg.info(f"HTTP {r.status_code} in {dt:.3f}sec")
+        r.raise_for_status()
+        responses.append(r.json())
+
+    # idx 0  is copied or returned as-is -> check separately in advance
+    for pt in responses[0]["matched_points"]:
+        if not("edge_index" in pt):
+            lg.warning(f"failed to match point {pt['lon']}, {pt['lat']} "
+                f"({pt['type']=})")
+
+    if len(parts) == 1:
+        # no combining necessary
+        lg.info(f"returned single-query result")
+        return responses[0]
+
+    combined = responses.pop(0)
+    offset = len(combined["edges"])
+    lg.info(f"starting multi-query result with {offset} edges")
+    while responses:
+        resp = responses.pop(0)
+        for pt in resp["matched_points"]:
+            if "edge_index" in pt:
+                pt["edge_index"] += offset
+            else:
+                lg.warning(f"failed to match point {pt['lon']}, {pt['lat']} "
+                    f"({pt['type']=})")
+        combined["edges"].extend(resp["edges"])
+        combined["matched_points"].extend(resp["matched_points"])
+        offset = len(combined["edges"])
+        lg.info(f"updated multi-query result to {offset} edges")
+    lg.info(f"returned multi-query result")
+    return combined
 
 
 if __name__ == "__main__":
     ROOT = Path(__file__).parents[3]
-    fp = ROOT / "data/roadinfo/test_segment_sasolburg.geojson"
-    info = get_info(fp)
-    speed = get_speed(info)
 
-    plot_road(fp, speed, max_speed=None)
+    day = 8
+
+    n = 1
+    fp = ROOT / f"data/roadinfo/day{day}_route{n}.geojson"
+    fig, ax = plt.subplots()
+    while fp.is_file():
+        info = get_info(fp)
+        speed = get_speed(info)
+        fig, ax = plot_road(fp, speed, min_speed=20, max_speed=120, fig=fig, ax=ax)
+        fp = ROOT / f"data/roadinfo/day{day}_route{(n := n+1)}.geojson"
+    
+    fp = ROOT / f"data/roadinfo/day{day}_loop.geojson"
+    if fp.is_file():
+        info = get_info(fp)
+        speed = get_speed(info)
+        # plot_road(fp, speed, max_speed=100)
+        plot_road(fp, speed, min_speed=20, max_speed=120, fig=fig, ax=ax)
 
     plt.show()
