@@ -135,6 +135,9 @@ dmypy.json
 *.key
 *.key_secret
 
+# route data handled externally
+*.geojson
+
 
 # communication logfiles -> exclude, except during race
 *_ser_comm.csv

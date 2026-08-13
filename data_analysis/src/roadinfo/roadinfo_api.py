@@ -31,7 +31,7 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
 
-    from plot_road import plot_road
+    from plot_road import plot_road, plot_altitude
 
     lg.basicConfig(level=lg.INFO, handlers=[lg.StreamHandler()])
 lg = lg.getLogger(__name__)
@@ -104,6 +104,41 @@ def get_speed(info: dict) -> list(tuple):
         edge = info["edges"][idx]
         speeds.append((edge.get("speed"), edge.get("speed_limit")))
     return speeds
+
+
+def scan_cache(fps: list[Path]) -> dict:
+    """Scan cache for missing or obsolete files
+    Args:
+        fps: list of files or directories for which a cached file is expected.
+            all files in directories are scanned, subdirectories are ignored
+    Returns:
+        dict of {
+        'missing': list of unmatched in fps,
+        'orphans': list of orphaned chache files
+        'mapped' : dict of cachefile: fp pairs}
+    """
+    ls_fp = []
+    for fp in fps:
+        if fp.is_file():
+            ls_fp.append(fp)
+        elif fp.is_dir():
+            ls_fp.extend([f for f in fp.iterdir() if f.is_file()])
+
+    hashset = {f.name for f in cachedir.iterdir()}
+
+    missing = []
+    found = {}
+    for fp in ls_fp:
+        with open(fp, 'r') as f:
+            s = f.read()
+        h = hashlib.sha256(s.encode("utf-8")).hexdigest()
+        if _get_cache(h) is None:
+            missing.append(fp)
+        else:
+            found[h] = fp
+            hashset.remove(h)
+    
+    return {"missing": missing, "orphans": list(hashset), "mapped": found}
 
 
 # -----------------------------------------------------------------------------
@@ -202,22 +237,50 @@ def _get_api(geo: dict):
 if __name__ == "__main__":
     ROOT = Path(__file__).parents[3]
 
+    # scan = scan_cache([ROOT / "data/roadinfo/"])
+    # print("missing:")
+    # for m in scan["missing"]:
+    #     print(f"- {m}")
+    # print("orphans:")
+    # for o in scan["orphans"]:
+    #     print(f"x {o}")
+    # print("found:")
+    # for h, fp in scan["mapped"].items():
+    #     print(f"+ {h}: {fp}")
+    # exit(0)
+
     day = 8
 
     n = 1
     fp = ROOT / f"data/roadinfo/day{day}_route{n}.geojson"
     fig, ax = plt.subplots()
+    fig2, ax2 = plt.subplots()
+    dist = 0
     while fp.is_file():
         info = get_info(fp)
         speed = get_speed(info)
         fig, ax = plot_road(fp, speed, min_speed=20, max_speed=120, fig=fig, ax=ax)
+        fig2, ax2, dist = plot_altitude(fp, dist, fig2, ax2, label=f"day{day}_{n}")
         fp = ROOT / f"data/roadinfo/day{day}_route{(n := n+1)}.geojson"
-    
+
     fp = ROOT / f"data/roadinfo/day{day}_loop.geojson"
     if fp.is_file():
         info = get_info(fp)
         speed = get_speed(info)
         # plot_road(fp, speed, max_speed=100)
         plot_road(fp, speed, min_speed=20, max_speed=120, fig=fig, ax=ax)
+        fig2, ax2, *_ = plot_altitude(fp, 0, fig2, ax2, label=f"day{day}_L")
+
+
+    fp = ROOT / f"data/roadinfo/manual_day1.geojson"
+    if fp.is_file():
+        info = get_info(fp)
+        speed = get_speed(info)
+        # plot_road(fp, speed, max_speed=100)
+        plot_road(fp, speed, min_speed=20, max_speed=120, fig=fig, ax=ax, linestyle=":")
+        fig2, ax2, *_ = plot_altitude(fp, 0, fig2, ax2, label=f"manual", linestyle=":")
+
+
+    ax2.legend()
 
     plt.show()

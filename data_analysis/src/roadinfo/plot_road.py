@@ -24,7 +24,7 @@ elif __package__ == "":
 # ~~~ </include dir hack > ~~~
 
 
-from ..geojson.read_geojson import resolve_geo_to_coords
+from ..geojson.read_geojson import resolve_geo_to_coords, lonlat2angular
 
 lg = logging.getLogger(__name__)
 
@@ -38,7 +38,8 @@ def plot_road(
     fig: plt.Figure = None,
     ax: plt.Axes = None,
     cmap_name: str = "turbo",
-    cmap_label: str = "speed [km/h]"
+    cmap_label: str = "speed [km/h]",
+    **kwargs
 ) -> tuple[Figure, Axes]:
     """plot road speed on new or existing plot
     Args:
@@ -50,6 +51,7 @@ def plot_road(
         fig, ax: existing plot, or None for new one
         cmap_name: colormap to use (plt.get_cmap() must know it)
         speed_unit: printed on y-axis of colorbar
+        **kwargs: forwarded to plt.plot()
     Returns:
         (fig, ax) of plot that was drawn on
     """
@@ -60,6 +62,8 @@ def plot_road(
             "either both fig and ax must be given, or None of them")
     if fig is None:
         fig, ax = plt.subplots()
+    fixed_linestyle = "linestyle" in kwargs
+    fixed_color     = "color"     in kwargs
 
     speeds = np.array(speeds, dtype=float)
     speeds = speeds[:,1] if use_limit else speeds[:,0]
@@ -80,12 +84,15 @@ def plot_road(
     for xya1, xya2, speed in zip(coords[:-1], coords[1:], speeds[1:]):
         x, y, *a = np.vstack([xya1, xya2]).T
         if np.isnan(speed):
-            ls = ":"
-            c = '#DDDDDD'
+            if not(fixed_linestyle): kwargs["linestyle"] = ":"
+            if not(fixed_color    ): kwargs["color"    ] = '#DDDDDD'
+
+            dist = lonlat2angular([xya1, xya2])[0, 1]
+            lg.warn(f"no speed info for {dist:.0f}m ({xya1} -> {xya2})")
         else:
-            ls = "-"
-            c = cmap(cbar.norm(speed))
-        ax.plot(x, y, color=c, linestyle=ls)
+            if not(fixed_linestyle): kwargs["linestyle"] = "-"
+            if not(fixed_color    ): kwargs["color"    ] = cmap(cbar.norm(speed))
+        ax.plot(x, y, **kwargs)
     ax.axis('equal')
 
     return fig, ax
@@ -93,3 +100,28 @@ def plot_road(
 # todo:
 # def plot_landmarks(fig, ax, [[lon,lat],[lon,lat]]):
 #   """label some known points on map for nicer overview"""
+
+
+def plot_altitude(
+    geo: dict, 
+    x_offset: float = 0,
+    fig: plt.Figure = None, 
+    ax: plt.Axes = None, 
+    **kwargs
+):
+    # coords = np.asarray(coords)
+    # if not coords.shape[1] == 3:
+    #     raise ValueError("cannot interpret data as (lon, lat, alt) points")
+    coords = resolve_geo_to_coords(geo, altitude="need")
+    
+    dpaths = lonlat2angular(coords)
+    xaxis = np.cumsum(np.hstack([x_offset, dpaths.T[1]]))
+
+    if (fig is None) != (ax is None):
+        raise ValueError(
+            "either both fig and ax must be given, or None of them")
+    if fig is None:
+        fig, ax = plt.subplots()
+
+    ax.plot(xaxis, coords.T[2], **kwargs)
+    return fig, ax, xaxis[-1]
