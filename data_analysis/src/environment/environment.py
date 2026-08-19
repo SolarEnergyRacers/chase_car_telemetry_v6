@@ -1,20 +1,49 @@
 
 
+import hashlib
+import json
+import logging as lg
+import time
+from   datetime import date, datetime, timezone
+from   pathlib import Path
+
 import numpy as np
+import pandas as pd
+import requests
+
+# ~~~ < include dir hack > ~~~
+# normalize include dir root (same pattern as roadinfo/roadinfo_api.py)
+py_root = Path(__file__).resolve().parents[1]  # data_analysis/src/
+if __package__ is None:
+    import sys
+    sys.path.insert(0, str(py_root.parent))
+    __package__ = py_root.name + ".environment"
+elif __package__ == "":
+    __package__ = py_root.name + ".environment"
+# ~~~ </include dir hack > ~~~
 
 from .sun_angles import *
+from ..geojson.read_geojson import resolve_geo_to_coords, lonlat2angular
 
+if __name__ == "__main__":
+    # demo run, see below
+    lg.basicConfig(level=lg.INFO, handlers=[lg.StreamHandler()])
+lg = lg.getLogger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# physics (unchanged)
 
 def solar_power_gen(
-    sun_power, 
-    sun_visibility, 
-    sun_angle, 
-    panel_sqm, 
-    panel_eff, 
-    panel_angle, 
+    sun_power,
+    sun_visibility,
+    sun_angle,
+    panel_sqm,
+    panel_eff,
+    panel_angle,
 ):
     sun_percentage = (  # negligible?
-        atmospheric_travel_distance(sun_angle) / 
+        atmospheric_travel_distance(sun_angle) /
         atmospheric_travel_distance(0))
     sun_power = sun_power * sun_visibility**sun_percentage
     panel_cosine = np.cos((sun_angle-panel_angle)/180*np.pi)
@@ -28,3 +57,444 @@ def forward_windspeed(
 ):
     angle = (car_direction - wind_direction)
     return np.cos(angle/180*np.pi)*wind_speed
+
+
+# -----------------------------------------------------------------------------
+# weather (Open-Meteo) - setup
+
+cachedir = Path(__file__).parent / "weather_cache"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
+
+# Open-Meteo serves a rolling past/future window (recent past + up to ~16
+# days forecast) from FORECAST_URL; anything older than that only exists in
+# the immutable historical archive at ARCHIVE_URL, which lags
+# ~5 days behind "now". This distinction also drives cache behaviour below:
+# archive answers never change for a given query and are cached forever,
+# forecast answers can change as newer model runs come in and are refreshed
+# every time (see _get_cache()/_set_cache()).
+FORECAST_PAST_DAYS_MAX = 92
+FORECAST_FUTURE_DAYS_MAX = 16
+
+DEFAULT_HOURLY_VARS = [
+    "shortwave_radiation",       # GHI, W/m^2, horizontal - use while driving
+    "direct_normal_irradiance",  # DNI, W/m^2, perpendicular to sun
+    "diffuse_radiation",         # DHI, W/m^2, horizontal
+    "global_tilted_irradiance",  # GTI, W/m^2, per `tilt`/`azimuth` below -
+                                  # with tilt=azimuth=nan (the default here)
+                                  # this is a 2-axis sun tracker, i.e. what a
+                                  # parked car aligning its panel to the sun
+                                  # at a control stop / loop break sees.
+    "wind_speed_10m",            # m/s (see wind_speed_unit in _get_api())
+    "wind_direction_10m",        # deg
+]
+
+if not cachedir.is_dir():
+    if cachedir.exists():
+        raise RuntimeError(
+            f"weather cache dir {cachedir} exists but is not a directory")
+    lg.info(f"creating weather cache '{cachedir}'...")
+    cachedir.mkdir()
+else:
+    lg.info(f"using weather cache '{cachedir}'...")
+
+
+# -----------------------------------------------------------------------------
+# weather - route resampling
+
+def resample_route(coords: np.ndarray, spacing_km: float):
+    """Resample a route to (approximately) even spacing along its length.
+
+    Uses linear interpolation of lon/lat between the original vertices,
+    weighted by arc-length (via lonlat2angular's haversine distances) - a
+    fine approximation at the vertex spacing typical of GPS-derived routes
+    and the km-scale spacing used here;
+
+    Args:
+        coords: (N,2) or (N,3) array of [lon, lat, (alt)], e.g. straight
+            from read_geojson.resolve_geo_to_coords().
+        spacing_km: target distance between resampled points, in km.
+
+    Returns:
+        (points, distance_km):
+            points: (M,2) array of [lat, lon] (note the order - lat first,
+                matching fetch_weather()'s argument order).
+            distance_km: (M,) cumulative distance from the route start, km.
+    """
+    deltas = lonlat2angular(coords)  # [compass, distance_m, (rise)] per seg.
+    seg_dist_m = deltas[:, 1]
+    cum_dist_m = np.concatenate([[0.0], np.cumsum(seg_dist_m)])
+    total_m = cum_dist_m[-1]
+
+    n_points = max(2, int(np.floor(total_m / (spacing_km * 1e3))) + 1)
+    target_m = np.linspace(0.0, total_m, n_points)
+
+    lons = coords[:, 0]
+    lats = coords[:, 1]
+    out_lat = np.interp(target_m, cum_dist_m, lats)
+    out_lon = np.interp(target_m, cum_dist_m, lons)
+    points = np.stack([out_lat, out_lon], axis=1)
+    return points, target_m / 1e3
+
+
+# -----------------------------------------------------------------------------
+# weather - output structure
+
+class RouteWeather:
+    """Weather data sampled at points along a route, indexed by distance
+    along the route and by time. Backed by a pandas.DataFrame with a
+    (distance_km, time) MultiIndex; use .at() rather than indexing the
+    DataFrame directly, it handles nearest-point lookup and time
+    interpolation.
+    """
+
+    def __init__(self, df: pd.DataFrame, points: np.ndarray,
+                 distance_km: np.ndarray):
+        """
+        Args:
+            df: rows indexed by MultiIndex (distance_km, time), one column
+                per fetched weather variable.
+            points: (M,2) array of [lat, lon], aligned with distance_km.
+            distance_km: (M,) cumulative route distance, aligned with
+                points - i.e. points[i] was sampled at distance_km[i].
+        """
+        self.df = df
+        self.points = points
+        self.distance_km = distance_km
+
+    def _nearest_distance_for_coord(self, lat: float, lon: float) -> float:
+        """crude nearest-neighbour in degrees - fine given the sampled
+        points are only ~spacing_km apart along a single known route;
+        not a substitute for a real distance calc over long distances."""
+        d2 = (self.points[:, 0] - lat)**2 + (self.points[:, 1] - lon)**2
+        return float(self.distance_km[int(np.argmin(d2))])
+
+    def at(self, time_utc, *, distance_km: float = None,
+           lat: float = None, lon: float = None) -> pd.Series:
+        """Look up weather nearest to a route position, interpolated in
+        time between the (hourly) samples.
+
+        Args:
+            time_utc: timestamp to interpolate to. Naive datetimes are
+                assumed to already be UTC.
+            distance_km: distance along the route (same convention as
+                resample_route()) - the natural key if the caller (e.g.
+                the simulation loop in driving.py) already tracks distance
+                travelled.
+            lat, lon: alternative to distance_km - nearest sampled point
+                is found by raw coordinate distance instead. Give either
+                distance_km, or both lat and lon - not both forms.
+
+        Returns:
+            pd.Series of variable values at the nearest sampled route
+            point, linearly interpolated in time to time_utc.
+        """
+        if distance_km is None:
+            if lat is None or lon is None:
+                raise ValueError(
+                    "give either distance_km, or both lat and lon")
+            distance_km = self._nearest_distance_for_coord(lat, lon)
+        elif lat is not None or lon is not None:
+            raise ValueError(
+                "give either distance_km, or lat/lon - not both")
+
+        idx = int(np.argmin(np.abs(self.distance_km - distance_km)))
+        nearest = self.distance_km[idx]
+        sub = self.df.xs(nearest, level="distance_km").sort_index()
+
+        t = pd.Timestamp(time_utc)
+        if t.tzinfo is None:
+            t = t.tz_localize("UTC")
+        if t <= sub.index[0]:
+            return sub.iloc[0]
+        if t >= sub.index[-1]:
+            return sub.iloc[-1]
+        i1 = sub.index.searchsorted(t)
+        i0 = i1 - 1
+        t0, t1 = sub.index[i0], sub.index[i1]
+        frac = (t - t0) / (t1 - t0)
+        return sub.iloc[i0] + (sub.iloc[i1] - sub.iloc[i0]) * frac
+
+
+# -----------------------------------------------------------------------------
+# weather - public
+
+def fetch_weather(
+    lat: float,
+    lon: float,
+    day: date,
+    variables: list = None,
+    tilt: float = float("nan"),
+    azimuth: float = float("nan"),
+) -> pd.DataFrame:
+    """Get one day of hourly weather at a single point.
+
+    Args:
+        lat, lon: coordinates in degrees.
+        day: UTC calendar date (a datetime is also accepted, only its date
+            part is used). The full day (00:00-23:00 UTC) is always
+            returned.
+        variables: hourly Open-Meteo variable names to fetch. Defaults to
+            DEFAULT_HOURLY_VARS (GHI, DNI, DHI, GTI, wind speed/direction).
+        tilt, azimuth: panel orientation in degrees for
+            'global_tilted_irradiance' (ignored if that variable isn't
+            requested). Default is float('nan') for both, i.e. a 2-axis
+            sun tracker - per Open-Meteo's convention, "nan" requests
+            bi-axial tracking.
+
+    Returns:
+        pd.DataFrame indexed by UTC time (tz-aware), one column per
+        variable in `variables`.
+    """
+    points = np.array([[lat, lon]])
+    return _fetch_weather_batch(points, day, variables, tilt, azimuth)[0]
+
+
+def fetch_weather_along_route(
+    geo,
+    day: date,
+    spacing_km: float = 5.0,
+    variables: list = None,
+    tilt: float = float("nan"),
+    azimuth: float = float("nan"),
+) -> RouteWeather:
+    """Get one day of hourly weather along a route, resampled to
+    approximately even spacing.
+
+    Args:
+        geo: anything accepted by read_geojson.resolve_geo_to_coords() - a
+            path to a .geojson file, a geojson dict, or a coordinate array.
+        day, variables, tilt, azimuth: see fetch_weather(). The defaults
+            request the full variable set (incl. sun-tracking GTI) at
+            all points, including ones on the open road.
+        spacing_km: target distance between weather query points along the
+            route. Open-Meteo's own model grid is roughly 9-25km depending
+            on model/region. All points for one day go into a single
+            batched HTTP call (Open-Meteo accepts comma-separated
+            lat/lon lists).
+
+    Returns:
+        RouteWeather wrapping all fetched points - see that class'
+        docstring for the lookup API.
+    """
+    coords = resolve_geo_to_coords(geo, altitude="drop")  # (N,2) lon/lat
+    points, distance_km = resample_route(coords, spacing_km)  # (M,2) lat/lon
+
+    dfs = _fetch_weather_batch(points, day, variables, tilt, azimuth)
+
+    frames = []
+    for dist, df in zip(distance_km, dfs):
+        df = df.copy()
+        df.index.name = "time"
+        df["distance_km"] = dist
+        df = df.set_index("distance_km", append=True)
+        df = df.reorder_levels(["distance_km", "time"])
+        frames.append(df)
+    combined = pd.concat(frames).sort_index()
+
+    return RouteWeather(combined, points, distance_km)
+
+
+# -----------------------------------------------------------------------------
+# weather - private
+
+def _coerce_date(day) -> date:
+    if isinstance(day, datetime):
+        return day.date()
+    return day
+
+
+def _is_archive_date(day: date) -> bool:
+    """True once a date is old enough to only be servable by the
+    historical archive; False while it's still inside the
+    forecast endpoint's rolling past/future window, where the answer can
+    still change as newer model runs come in (see _set_cache())."""
+    return (date.today() - day).days > FORECAST_PAST_DAYS_MAX
+
+
+def _check_forecast_horizon(day: date) -> None:
+    days_ahead = (day - date.today()).days
+    if days_ahead > FORECAST_FUTURE_DAYS_MAX:
+        lg.warning(
+            f"{day} is {days_ahead} days out - beyond Open-Meteo's "
+            f"~{FORECAST_FUTURE_DAYS_MAX}-day forecast horizon; the "
+            f"request may fail or return low-confidence data")
+
+
+def _cache_key(points: np.ndarray, day: date, variables: list,
+               tilt: float, azimuth: float) -> str:
+    """deterministic hash identifying one (points, day, variables, panel
+    orientation) query - NOT a hash of the response, see _get_cache()/
+    _set_cache() for why the response itself still needs different
+    treatment for archive vs. forecast dates."""
+    payload = {
+        "points": [[round(float(lat), 5), round(float(lon), 5)]
+                   for lat, lon in points],
+        "date": day.isoformat(),
+        "variables": sorted(variables),
+        "tilt": tilt,
+        "azimuth": azimuth,
+    }
+    s = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _get_cache(key: str, archive: bool) -> dict | list | None:
+    """Read a cached response, if any.
+
+    Archive (historical) dates: reads the single immutable cache file.
+    Forecast dates: reads the '_latest' file, i.e. the most recently
+        fetched snapshot for this key. This is NOT guaranteed to be the
+        same data an earlier run used - see _set_cache().
+    """
+    fn = cachedir / (key if archive else f"{key}_latest")
+    if fn.is_file():
+        with fn.open('r') as file:
+            lg.info(f"reading {fn.name} from cache")
+            return json.load(file)
+    return None
+
+
+def _set_cache(key: str, archive: bool, response) -> None:
+    """Write a response to cache.
+
+    Archive dates are written once - a second write for the same key is
+    a no-op, since the data cannot change anymore.
+
+    Forecast dates are always refreshed: a timestamped snapshot is kept.
+    The file _get_cache() reads for actual planning.
+    """
+    if archive:
+        fn = cachedir / key
+        if fn.exists():
+            return  # immutable, nothing to do
+        with fn.open('w') as file:
+            json.dump(response, file)
+        lg.info(f"wrote {fn.name} to cache ({int(fn.stat().st_size/1e3)}kB)")
+        return
+
+    fetched_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    snapshot_fn = cachedir / f"{key}_fetched{fetched_at}"
+    latest_fn = cachedir / f"{key}_latest"
+    entries = response if isinstance(response, list) else [response]
+    tagged = [{**e, "_fetched_at": fetched_at} for e in entries]
+    tagged = tagged if isinstance(response, list) else tagged[0]
+    with snapshot_fn.open('w') as file:
+        json.dump(tagged, file)
+    with latest_fn.open('w') as file:
+        json.dump(tagged, file)
+    lg.info(f"wrote {snapshot_fn.name} and updated {latest_fn.name} "
+             f"({int(latest_fn.stat().st_size/1e3)}kB)")
+
+
+def _get_api(points: np.ndarray, day: date, variables: list,
+             tilt: float, azimuth: float):
+    """Query Open-Meteo for one or more points on a single UTC day.
+
+    Args:
+        points: (N,2) array of (lat, lon).
+        day: date to query, interpreted and returned in UTC.
+        variables: hourly variable names, e.g. DEFAULT_HOURLY_VARS.
+        tilt, azimuth: panel orientation for 'global_tilted_irradiance',
+            in degrees, or float('nan') for sun-tracking (see
+            fetch_weather()). Required if 'global_tilted_irradiance' is in
+            `variables`, ignored otherwise.
+
+    Returns:
+        dict (single point) or list of dict (multiple points), as returned
+        by Open-Meteo - one 'hourly' block per point.
+    """
+    archive = _is_archive_date(day)
+    if archive:
+        url = ARCHIVE_URL
+    else:
+        url = FORECAST_URL
+        _check_forecast_horizon(day)
+
+    params = {
+        "latitude": ",".join(f"{lat:.5f}" for lat, lon in points),
+        "longitude": ",".join(f"{lon:.5f}" for lat, lon in points),
+        "start_date": day.isoformat(),
+        "end_date": day.isoformat(),
+        "hourly": ",".join(variables),
+        "timezone": "UTC",
+        "wind_speed_unit": "ms",
+    }
+    if "global_tilted_irradiance" in variables:
+        if tilt is None or azimuth is None:
+            raise ValueError(
+                "requesting 'global_tilted_irradiance' needs tilt and "
+                "azimuth (use float('nan') for both for sun-tracking)")
+        params["tilt"] = tilt
+        params["azimuth"] = azimuth
+
+    t0 = time.monotonic()
+    r = requests.get(url, params=params)
+    dt = time.monotonic() - t0
+    if r.status_code >= 300:
+        lg.error(f"HTTP {r.status_code}: {r.text} (after {dt:.3f}sec)")
+    lg.info(f"HTTP {r.status_code} in {dt:.3f}sec ({url})")
+    r.raise_for_status()
+    return r.json()
+
+
+def _fetch_weather_batch(
+    points: np.ndarray,
+    day: date,
+    variables: list = None,
+    tilt: float = float("nan"),
+    azimuth: float = float("nan"),
+) -> list:
+    """Fetch (or read from cache) one hourly weather DataFrame per point.
+
+    Args:
+        points: (N,2) array of (lat, lon).
+        day: see fetch_weather().
+        variables, tilt, azimuth: see fetch_weather().
+
+    Returns:
+        list of pd.DataFrame, one per point in `points` (same order),
+        each indexed by UTC time (tz-aware) with one column per variable.
+    """
+    day = _coerce_date(day)
+    if variables is None:
+        variables = DEFAULT_HOURLY_VARS
+
+    archive = _is_archive_date(day)
+    key = _cache_key(points, day, variables, tilt, azimuth)
+
+    response = _get_cache(key, archive)
+    if response is None:
+        response = _get_api(points, day, variables, tilt, azimuth)
+        _set_cache(key, archive, response)
+
+    entries = response if isinstance(response, list) else [response]
+    if len(entries) != len(points):
+        raise RuntimeError(
+            f"Open-Meteo returned {len(entries)} locations for "
+            f"{len(points)} requested points")
+
+    dfs = []
+    for entry in entries:
+        hourly = entry["hourly"]
+        idx = pd.to_datetime(hourly["time"], utc=True)
+        cols = {v: hourly[v] for v in variables}
+        dfs.append(pd.DataFrame(cols, index=idx))
+    return dfs
+
+if __name__ == "__main__":
+    # demo: full-day weather along day N's ToControlStop + loop
+    GITHUB_ROOT = Path(__file__).parents[4]  # .../Documents/GitHub
+    day_n = 8
+    target_date = date.today()
+    fp = GITHUB_ROOT / "strategy-private" / "route_geojson" / f"day{day_n}_route1.geojson"
+    if fp.is_file():
+        rw = fetch_weather_along_route(fp, target_date, spacing_km=5.0)
+        print(f"{len(rw.distance_km)} points, "
+              f"{rw.distance_km[-1]:.1f}km total")
+        sample_time = datetime(
+            target_date.year, target_date.month, target_date.day, 10,
+            tzinfo=timezone.utc)
+        print(rw.at(sample_time, distance_km=rw.distance_km[len(rw.distance_km)//2]))
+    else:
+        print(f"file not found: {fp}")
