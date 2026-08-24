@@ -72,15 +72,71 @@ def drive_power(car: Car_coeffs, speed: float, v_speed: float, fwd_airspeed:
     return v_ @ M
 
 
+def apply_speed_limit(
+    distances: np.array,
+    limits: np.array, 
+    delta_time: timedelta,
+    allow_time_overrun: bool = False
+) -> np.ndarray:
+    """Calculate road segment speeds based on speed limit and target time.
+    Args:
+        distances: road segment lengths, in m
+        limits: expected max. speed for each segment, in km/h
+        delta_time: total time allocated for the road segment array
+        allow_time_overrun: if True, return limits if exceeding delta_time
+            instead of raising ValueError(). 
+            Use with care, no notice is given if this has happened.
+    Returns:
+        array of speed values corresponding to each road segment
+    """
+    if not len(distances) == len(limits):
+        raise ValueError(
+            f"distances and limits must be of the same length, "
+            f"but are {len(distances)} and {len(limits)} respectively.")
+
+    speed_lim = limits / 3.6  # km/h -> m/s
+    ideal_speed = np.sum(distances) / delta_time.total_seconds()
+    speeds = np.ones(len(distances), dtype=float) * ideal_speed
+
+    maxiter = 0
+    while any(speeds > speed_lim):
+        mask = (speeds >= speed_lim)
+        # assignment only -> '>=' on float is needed to keep previously fixed
+        # in mask; but break criterium with '>' requires not including these
+        speeds = np.where(mask, speed_lim, speeds)
+        t_lock = np.sum(distances[mask] / speeds[mask])
+        t_free = delta_time.total_seconds() - t_lock
+        if t_free < 0:
+            if allow_time_overrun:
+                return limits
+            raise ValueError(
+                "cannot make journey in time due to speed limits. "
+                f"({tot_distance/1e3:.1f}km in {delta_time})")
+        # d_free = np.sum(np.where(~mask, distances, 0))
+        d_free = np.sum(distances[~mask])
+        ideal_speed = d_free / t_free
+        # speeds = np.where(mask, speeds, ideal_speed)
+        speeds[~mask] = ideal_speed
+
+        if (maxiter := maxiter+1) > 1000:
+            # at most one per speed limit steps, but routing speed does not 
+            # follow standard grid of k*10 values for integer k
+            raise RuntimeError(
+                f"Maximum iteration: Could not conclusively apply speed "
+                f"limits within {maxiter} steps")
+    return speeds
+
+
 def total_Ws_for_lap(
     # path: pd.DataFrame,  # index = ?
     path: np.ndarray,  # index = ?
-    roadinfo: np.ndarray,
+    roadinfo: pd.DataFrame,
     env: pd.DataFrame,  # index = time
     car: Car_coeffs,
     start_time: datetime,
     end_time: datetime = None,
     delta_time: timedelta = None,
+    fill_speedlimit: float = None
 ):
     """Calculate net energy consumption for a route within specified time.
     Args:
@@ -91,6 +147,7 @@ def total_Ws_for_lap(
         start_time: start time for journey (for sun + environment)
         end_time: target return time (mutually exclusive with delta_time)
         delta_time: journey time (mutually exclusive with end_time)
+        fill_speedlimit: If given, fill it in for missing speed values
     """
     error_list = []
     # speed limits / different speed parts?
@@ -113,9 +170,42 @@ def total_Ws_for_lap(
     print(f"path len = {np.sum(rpath["distance"])}")
 
     tot_distance = np.sum(rpath["distance"])
-    speed = tot_distance / delta_time.total_seconds()
-    assert speed > 0.0 and speed < 50.0, (
+    ideal_speed = tot_distance / delta_time.total_seconds()  # ideal
+    assert ideal_speed > 0.0 and ideal_speed < 50.0, (
         f"nonsensical avg. speed value: {speed*3.6:.2f}km/h")
+
+    if not fill_speedlimit is None:
+        roadinfo["speeds"] = roadinfo["speeds"].fillna(fill_speedlimit)
+    # speed_lim = roadinfo["speeds"] / 3.6  # km/h -> m/s
+
+    # speeds = np.ones(len(rpath)) * ideal_speed
+    # mask = (speeds > speed_lim)
+    # while any(mask):
+    #     speeds = np.where(mask, speed_lim, speeds)
+    #     t_lock = rpath["distance"][~mask] / speeds[~mask]
+    #     t_free = delta_time.total_seconds() - t_lock
+    #     if t_free < 0:
+    #         raise ValueError(
+    #             "cannot make journey in time due to speed limits. "
+    #             f"({tot_distance/1e3:.1f}km in {delta_time})"
+    #         )
+    #     d_free = np.sum(np.where(mask, rpath["distance"], 0))
+    #     ideal_speed = d_free / t_free
+    #     speeds = np.where(mask, ideal_speed, speeds)
+
+    #     mask = np.where(speeds < speed_lim)[0]
+    #     # speeds = np.clip(speeds, 0, roadinfo["speed"])
+
+    #     for want, limit in zip(speeds, roadinfo["speed"]):
+    #         if want > limit:
+    #             speeds_ok = 0
+    # rpath["speed"] = speeds
+
+    rpath["speed"] = apply_speed_limit(
+        rptath["distance"], 
+        roadinfo["speeds"], 
+        delta_time, 
+    )
 
     now = start_time
     Ws_total = 0

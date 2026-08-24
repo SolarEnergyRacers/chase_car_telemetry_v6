@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ser-data-analysis"
+version = "0.1.0"
+description = "data_analysis directory"
+readme = ""
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "requests",
+    "scipy",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

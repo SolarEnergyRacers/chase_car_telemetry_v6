@@ -24,7 +24,10 @@ elif __package__ == "":
 # ~~~ </include dir hack > ~~~
 
 
-from ..geojson.read_geojson import resolve_geo_to_coords, lonlat2angular
+try:
+    from ..geojson.read_geojson import resolve_geo_to_coords, lonlat2angular
+except ImportError:
+    from geojson.read_geojson import resolve_geo_to_coords, lonlat2angular
 
 lg = logging.getLogger(__name__)
 
@@ -102,6 +105,8 @@ def plot_road(
 #   """label some known points on map for nicer overview"""
 
 
+axcache = None
+ax2cache = None
 def plot_altitude(
     geo: dict, 
     x_offset: float = 0,
@@ -109,6 +114,7 @@ def plot_altitude(
     ax: plt.Axes = None, 
     **kwargs
 ):
+    global axcache, ax2cache
     # coords = np.asarray(coords)
     # if not coords.shape[1] == 3:
     #     raise ValueError("cannot interpret data as (lon, lat, alt) points")
@@ -123,5 +129,20 @@ def plot_altitude(
     if fig is None:
         fig, ax = plt.subplots()
 
+    inclines = (coords.T[2, 1:] - coords.T[2, :-1]) / dpaths.T[1]
+
+    import scipy.signal as sig
+    inclines = sig.savgol_filter(inclines, 10, 3)
+
+    if ax == axcache:
+        ax2 = ax2cache
+    else:
+        _, ax2 = plt.subplots()
+        axcache  = ax
+        ax2cache = ax2
+
     ax.plot(xaxis, coords.T[2], **kwargs)
+    ax2.step(xaxis[1:], inclines * 100, where="mid", **kwargs)
+    ax2.set_ylabel("incline (%)")
+    ax2.set_ylim(-10, 10)
     return fig, ax, xaxis[-1]

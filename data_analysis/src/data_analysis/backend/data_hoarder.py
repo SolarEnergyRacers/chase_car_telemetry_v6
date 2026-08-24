@@ -51,7 +51,7 @@ def weak_dtype_convert(data: str):
         return bool(data)
 
 
-def request_all_data():
+def request_all_data():  # todo: use new one in data_loader
     if "all_data" in st.session_state.keys():
         st.session_state.all_data += 1
     else:

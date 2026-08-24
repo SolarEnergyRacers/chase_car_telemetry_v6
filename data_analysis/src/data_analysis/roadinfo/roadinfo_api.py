@@ -22,7 +22,10 @@ elif __package__ == "":
 # print(f"roadinfo {py_root=}")
 # ~~~ </include dir hack > ~~~
 
-from ..geojson.read_geojson import lonlat2angular
+try:
+    from ..geojson.read_geojson import lonlat2angular
+except ImportError:
+    from geojson import lonlat2angular
 
 if __name__ == "__main__":
     # demo run, see below
@@ -249,7 +252,7 @@ if __name__ == "__main__":
     #     print(f"+ {h}: {fp}")
     # exit(0)
 
-    day = 8
+    day = 1
 
     n = 1
     fp = ROOT / f"data/roadinfo/day{day}_route{n}.geojson"
@@ -282,5 +285,6 @@ if __name__ == "__main__":
 
 
     ax2.legend()
+    ax2.grid(which="both")
 
     plt.show()
