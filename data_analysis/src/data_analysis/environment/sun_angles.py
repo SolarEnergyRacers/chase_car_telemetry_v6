@@ -9,6 +9,8 @@
 # https://basicfreetools.com/sun-angle-shadow-calculator/
 
 from   datetime import datetime
+from   typing import Union   # was missing -> `import environment.environment`
+import warnings
 import numpy as np
 
 
