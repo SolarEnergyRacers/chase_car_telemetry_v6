@@ -5,6 +5,7 @@ import json
 from   pathlib import Path
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
+from   matplotlib.lines import Line2D
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -58,7 +59,7 @@ def plot_road(
     Returns:
         (fig, ax) of plot that was drawn on
     """
-    coords = resolve_geo_to_coords(geo, altitude="drop")
+    coords = resolve_geo_to_coords(geo, altitude="keep")
 
     if (fig is None) != (ax is None):
         raise ValueError(
@@ -84,19 +85,78 @@ def plot_road(
         sm = cm.ScalarMappable(norm=norm, cmap=cmap)
         cbar = fig.colorbar(sm, ax=ax)
         cbar.set_label(cmap_label)
+    lines = []
     for xya1, xya2, speed in zip(coords[:-1], coords[1:], speeds[1:]):
         x, y, *a = np.vstack([xya1, xya2]).T
+        a = a[0] if len(a) > 0 else [float('nan'), float('nan')]
+        dist = lonlat2angular([xya1, xya2])[0, 1]
         if np.isnan(speed):
             if not(fixed_linestyle): kwargs["linestyle"] = ":"
             if not(fixed_color    ): kwargs["color"    ] = '#DDDDDD'
 
-            dist = lonlat2angular([xya1, xya2])[0, 1]
             lg.warn(f"no speed info for {dist:.0f}m ({xya1} -> {xya2})")
         else:
             if not(fixed_linestyle): kwargs["linestyle"] = "-"
             if not(fixed_color    ): kwargs["color"    ] = cmap(cbar.norm(speed))
-        ax.plot(x, y, **kwargs)
+        line, = ax.plot(x, y, picker=3, **kwargs)
+        line.metadata = {
+            "index": len(lines),
+            "speed": speed,
+            "alt": a[1] - a[0],
+            "dist": dist,
+            "loc1": xya1,
+            "loc2": xya2,
+        }
+        lines.append(line)
     ax.axis('equal')
+
+    tooltip = ax.annotate("", xy=(0, 0), xytext=(15, 15), 
+        textcoords="offset points",
+        bbox=dict(boxstyle="round", fc="white", ec="gray"))
+
+    cache = {
+        'lw': lines[0].get_linewidth(),
+        'last_line': type("No_line", (), {
+            "contains": lambda *a: (False, 0),
+            "set_linewidth": lambda *a: None,
+        })()
+    }
+    def on_hover(event):
+        if event.inaxes != ax:
+            if tooltip.get_visible():
+                tooltip.set_visible(False)
+                fig.canvas.draw_idle()
+            return
+
+        contains, _ = cache['last_line'].contains(event)
+        if contains:
+            # fig.canvas.draw_idle()
+            return
+        else:
+            cache['last_line'].set_linewidth(cache['lw'])
+
+        for line in lines:
+            contains, _ = line.contains(event)
+            if contains:
+                s = line.metadata
+
+                tooltip.xy = (event.xdata, event.ydata)
+                tooltip.set_text(
+                    f"{s['index']}:" +
+                    f"\n{s['dist']:.0f}m at {s['speed']}km/h" +
+                    f"\nfrom {s['loc1'][:2]}\nto      {s['loc2'][:2]}" +
+                   (f"\nalt. change {s['alt']:+.0f}m" 
+                        if not np.isnan(s['alt']) else "")
+                )
+                tooltip.set_visible(True)
+                line.set_linewidth(3*cache['lw'])
+                cache['last_line'] = line
+                break
+        else:
+            tooltip.set_visible(False)
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("motion_notify_event", on_hover)
 
     return fig, ax
 
