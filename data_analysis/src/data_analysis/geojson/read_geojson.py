@@ -1,5 +1,6 @@
 
 
+import pandas as pd
 import logging
 import json
 import numpy as np
@@ -53,7 +54,7 @@ def get_paths(geo: dict):
 def resolve_geo_to_coords(geo: any, altitude: str = "keep") -> np.ndarray:
     """Take geojson, or part of it, and get its LineString property
     Args:
-        geo: path to geojson, geojson dict, or coordinates as list / array
+        geo: path to geojson, geojson dict, df, or coordinates as list / array
             (latter case is returned unmodified)
         altitude: 
             'keep': return if available, don't care if missing from geo;
@@ -69,7 +70,7 @@ def resolve_geo_to_coords(geo: any, altitude: str = "keep") -> np.ndarray:
     else:
         raise ValueError(
             f"altitude must be 'keep', 'need' or 'drop', but is '{altitude}'")
-    
+
     # from file
     if isinstance(geo, str):
         geo = Path(geo)
@@ -91,6 +92,24 @@ def resolve_geo_to_coords(geo: any, altitude: str = "keep") -> np.ndarray:
     # from array-like
     if isinstance(geo, list) or isinstance(geo, tuple):
         geo = np.array(geo, dtype=float)
+    if isinstance(geo, pd.DataFrame):
+        # order of known matters. 
+        known = ["longitude", "lon", "latitude", "lat", "altitude", "alt"]
+        cols = [key for key in known if key in geo.columns]
+        if not len(cols) >= 2:
+            raise KeyError(
+                f"geo dataframe is missing required columns. "
+                f"Valid are {known}, but got {list(geo.columns)} instead.")
+        if not( cols[0].startswith("lon") and cols[1].startswith("lat") ):
+            raise KeyError(
+                f"geo dataframe is malformed. Need lon,lat,(alt) info "
+                f"in that order, but found {cols} instead.")
+        if len(cols) == 3 and not cols[2].startswith("alt"):
+            raise KeyError(
+                f"geo dataframe is malformed. Need lon,lat,(alt) info "
+                f"in that order, but found {cols} instead.")
+        lg.info(f"geo from df with cols {cols}")
+        geo = np.array(geo[cols])
     if isinstance(geo, np.ndarray):
         msg = "geo is array, but"
         if not len(geo.shape) == 2: 
@@ -106,6 +125,7 @@ def resolve_geo_to_coords(geo: any, altitude: str = "keep") -> np.ndarray:
         coords = geo
         if altitude == "drop":
             coords = coords[:, :2]
+        lg.info(f"found coords of shape {coords.shape}")
         return coords
 
     # giving up
