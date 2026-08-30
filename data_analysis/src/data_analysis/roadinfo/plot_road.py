@@ -114,23 +114,29 @@ def plot_road(
         textcoords="offset points",
         bbox=dict(boxstyle="round", fc="white", ec="gray"))
 
+    no_line = type("No_line", (), {
+        "contains": lambda *a: (False, 0),
+        "set_linewidth": lambda *a: None,
+    })()
     cache = {
         'lw': lines[0].get_linewidth(),
-        'last_line': type("No_line", (), {
-            "contains": lambda *a: (False, 0),
-            "set_linewidth": lambda *a: None,
-        })()
+        'last_line': no_line
     }
+
+    fig.latest_event = None
+    def on_motion(event):
+        fig.latest_event = event
+
     def on_hover(event):
         if event.inaxes != ax:
             if tooltip.get_visible():
                 tooltip.set_visible(False)
+                cache['last_line'] = no_line
                 fig.canvas.draw_idle()
             return
 
         contains, _ = cache['last_line'].contains(event)
         if contains:
-            # fig.canvas.draw_idle()
             return
         else:
             cache['last_line'].set_linewidth(cache['lw'])
@@ -154,9 +160,19 @@ def plot_road(
                 break
         else:
             tooltip.set_visible(False)
+            cache['last_line'] = no_line
         fig.canvas.draw_idle()
+        return True
 
-    fig.canvas.mpl_connect("motion_notify_event", on_hover)
+    def on_hover_():
+        if not fig.latest_event is None:
+            on_hover(fig.latest_event)
+        return True
+
+    fig.canvas.mpl_connect("motion_notify_event", on_motion)
+    fig.timer = fig.canvas.new_timer(interval=100)
+    fig.timer.add_callback(on_hover_)
+    fig.timer.start()
 
     return fig, ax
 
