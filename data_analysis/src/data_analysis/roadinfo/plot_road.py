@@ -6,6 +6,8 @@ from   pathlib import Path
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 from   matplotlib.lines import Line2D
+from matplotlib.figure import Figure
+from matplotlib.axes import Axes
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -173,6 +175,7 @@ def plot_road(
     fig.timer = fig.canvas.new_timer(interval=100)
     fig.timer.add_callback(on_hover_)
     fig.timer.start()
+    fig.canvas.mpl_connect("close_event", lambda _: fig.timer.stop())
 
     return fig, ax
 
