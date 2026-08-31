@@ -90,11 +90,13 @@ def get_speed(info: dict) -> list(tuple):
     """get speed from valhalla info dict
     Args:
         info: dict provided by valhalla api for one LineString
-    Returns:
-        list of (speed, speed_limit) at every point in the LineString. 
-            speed and/or speed_limit be None if value is not found in info.
-            It would appear that the end node speed applies to a segment 
-            between 2 coordinate points (-> use speeds[1:] rather than [:-1])
+   Returns:
+            list of (speed, speed_limit) for every point in the LineString,
+            taken from the edge each point was matched onto. Points sit
+            mid-edge (median distance_along_edge ~0.5), so where the edge
+            changes between two points the road transition lies somewhere
+            between them - neither point's value is exact for that segment.
+            Difference is negligible in practice (<0.5% of travel time).
     """
     speeds = []
     for e in info["matched_points"]:
