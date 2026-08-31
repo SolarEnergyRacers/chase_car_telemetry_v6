@@ -1,5 +1,5 @@
 
-from   datetime import datetime, timedelta, time as daytime
+from   datetime import datetime, timedelta, timezone, time as daytime
 import numpy as np
 import pandas as pd
 from   pathlib import Path
@@ -52,9 +52,12 @@ def validate_time(start: datetime, end: datetime):
     return errs
 
 
-def solar_p_gen(car: Car_coeffs, env: Environment, tm: datetime, coord: tuple, 
-        panel_angle: float):
-    sun_angle = calculate_SZA_from_datetime(tm, *coord[:2])
+def solar_p_gen(car: Car_coeffs, env: Environment, tm: datetime,
+        lat: float, lon: float, panel_angle: float):
+    if tm.tzinfo is None or tm.utcoffset() is None:
+        raise ValueError(f"tm must be timezone-aware (is {tm})")
+    sun_angle = calculate_SZA_from_datetime(
+        tm.astimezone(timezone.utc), lat, lon)
     return solar_power_gen(env.sun_power, env.sun_visibility, sun_angle,
             car.panel_sqm, car.panel_eff, panel_angle)
 
@@ -133,31 +136,26 @@ def apply_speed_limit(
                 f"limits within {maxiter} steps")
     return speeds
 
-
 def total_Ws_for_lap(
-    # path: pd.DataFrame,  # index = ?
-    path: np.ndarray,  # index = ?
-    roadinfo: pd.DataFrame,
-    env: pd.DataFrame,  # index = time
+    route: pd.DataFrame,
+    env: pd.DataFrame,
     car: Car_coeffs,
     start_time: datetime,
     end_time: datetime = None,
     delta_time: timedelta = None,
-    fill_speedlimit: float = None
-):
+) -> float:
     """Calculate net energy consumption for a route within specified time.
     Args:
-        path: list of (lon, lat, alt) entries
-        roadinfo: list of dict with speed (and more? info for each path entry)
-        env: Dataframe with environment info over time
+        route: df as provided by compile_route() / stitch_routes()
+        env: df with environment info over time, index = time (UTC).
+            Columns must match Environment.to_tuple() order.
         car: Car_coeffs performance parameters
-        start_time: start time for journey (for sun + environment)
-        end_time: target return time (mutually exclusive with delta_time)
-        delta_time: journey time (mutually exclusive with end_time)
-        fill_speedlimit: If given, fill it in for missing speed values
+        start_time: start of journey, UTC (sun angles depend on it)
+        end_time: target arrival time (mutually exclusive with delta_time)
+        delta_time: journey duration (mutually exclusive with end_time)
+    Returns:
+        net energy in Ws. Positive means drawn from the battery.
     """
-    error_list = []
-    # speed limits / different speed parts?
     if delta_time is None:
         if end_time is None:
             raise ValueError(
@@ -165,135 +163,78 @@ def total_Ws_for_lap(
         delta_time = end_time - start_time
     else:
         if not(end_time is None):
-            raise ValueError("Must specify either end_time or delta_time (both given)")
+            raise ValueError(
+                "Must specify either end_time or delta_time (both given)")
         end_time = start_time + delta_time
 
-    error_list.extend(validate_time(start_time, end_time))
+    if errs := validate_time(start_time, end_time):
+        raise ValueError("; ".join(errs))
 
-    apath = path
-    rpath = lonlat2angular(path)
-    cols  = ["azimuth", "distance", "incline"][:rpath.shape[1]]
-    rpath = pd.DataFrame(rpath, columns=cols)
-    print(f"path len = {np.sum(rpath["distance"])}")
+    # n nodes -> n-1 segments. Last row of a compiled route holds no segment.
+    distance   = route["distance"   ].to_numpy()[:-1]
+    azimuth    = route["azimuth"    ].to_numpy()[:-1]
+    max_speeds = route["speed_route"].to_numpy()[:-1]
+    lon        = route["longitude"  ].to_numpy()
+    lat        = route["latitude"   ].to_numpy()
+    incline    = np.diff(route["altitude"].to_numpy())  # m, filtered SRTM
+    mid_lon    = 0.5 * (lon[:-1] + lon[1:])
+    mid_lat    = 0.5 * (lat[:-1] + lat[1:])
 
-    tot_distance = np.sum(rpath["distance"])
-    ideal_speed = tot_distance / delta_time.total_seconds()  # ideal
-    assert ideal_speed > 0.0 and ideal_speed < 50.0, (
-        f"nonsensical avg. speed value: {speed*3.6:.2f}km/h")
+    speed = apply_speed_limit(distance, max_speeds, delta_time)  # m/s
+    dt    = distance / speed                                     # s
 
-    if not fill_speedlimit is None:
-        roadinfo["speeds"] = roadinfo["speeds"].fillna(fill_speedlimit)
-    # speed_lim = roadinfo["speeds"] / 3.6  # km/h -> m/s
-
-    # speeds = np.ones(len(rpath)) * ideal_speed
-    # mask = (speeds > speed_lim)
-    # while any(mask):
-    #     speeds = np.where(mask, speed_lim, speeds)
-    #     t_lock = rpath["distance"][~mask] / speeds[~mask]
-    #     t_free = delta_time.total_seconds() - t_lock
-    #     if t_free < 0:
-    #         raise ValueError(
-    #             "cannot make journey in time due to speed limits. "
-    #             f"({tot_distance/1e3:.1f}km in {delta_time})"
-    #         )
-    #     d_free = np.sum(np.where(mask, rpath["distance"], 0))
-    #     ideal_speed = d_free / t_free
-    #     speeds = np.where(mask, ideal_speed, speeds)
-
-    #     mask = np.where(speeds < speed_lim)[0]
-    #     # speeds = np.clip(speeds, 0, roadinfo["speed"])
-
-    #     for want, limit in zip(speeds, roadinfo["speed"]):
-    #         if want > limit:
-    #             speeds_ok = 0
-    # rpath["speed"] = speeds
-
-    rpath["speed"] = apply_speed_limit(
-        rptath["distance"], 
-        roadinfo["speeds"], 
-        delta_time, 
+    # segment mid-times, then one single interpolation pass over env
+    t_mid = (start_time
+        + pd.to_timedelta(np.cumsum(dt) - 0.5*dt, unit='s')).round('ms')
+    env_seg = (
+        env.reindex(env.index.union(t_mid))
+        .sort_index()
+        .bfill().ffill()  # extrapolate in zero-order hold
+        .interpolate(method="time")
+        .loc[t_mid]
     )
 
-    now = start_time
-    Ws_total = 0
-    for idx, segment in rpath.iterrows():
-        # approximate halfway distance as value for segment
-        coord = np.mean([apath[idx], apath[idx+1]], axis=0)
-        dt = segment["distance"] / speed
-        tm = now + timedelta(seconds = 0.5*dt)
+    Ws_total = 0.0
+    for i in range(len(distance)):
+        env_now = Environment.from_tuple(env_seg.iloc[i])
+        tm      = t_mid[i].to_pydatetime()
 
-        env_now = (
-            env.reindex(env.index.union([tm]))
-            .sort_index()
-            .bfill().ffill()  # extrapolate in zero-order hold
-            .interpolate(method="time")
-            .loc[tm]
-        )
-        env_now = Environment.from_tuple(env_now)
+        p_solar = solar_p_gen(car, env_now, tm, mid_lat[i], mid_lon[i], 0)
+        # ^ car cannot climb an incline that would matter for solar angle
 
-        p_solar = solar_p_gen(car, env_now, tm, coord, 0)
-        # ^ car cannot climb an incline that would matter in terms of solar angle
+        wind_fwd = forward_windspeed(
+            env_now.wind_speed, env_now.wind_direction, azimuth[i])
+        fwd_airspeed = speed[i] - wind_fwd  # todo: check +/-
+        v_speed = incline[i] / dt[i]
 
-        wind_fwd = forward_windspeed(env_now.wind_speed, 
-            env_now.wind_direction, segment["azimuth"])
-        # ^ only apply forward wind speed
-        fwd_airspeed = speed - wind_fwd  # todo: check +/-
+        p_motor = drive_power(car, speed[i], v_speed, fwd_airspeed)
+        Ws_total += dt[i] * (p_motor - p_solar)
 
-        if "incline" in segment:
-            v_speed = segment["incline"] / dt
-        else:
-            v_speed = 0
-
-        p_motor = drive_power(car, speed, v_speed, fwd_airspeed)
-
-        Ws_solar = dt * p_solar
-        Ws_motor = dt * p_motor
-        Ws_total += Ws_motor - Ws_solar
-        #  ---
-        now += timedelta(seconds = dt)
     return Ws_total
 
-
 if __name__ == "__main__":
-    import json
     ROOT = Path(__file__).parents[3]
-    fp = ROOT / "data/roadinfo/test_segment_sasolburg.geojson"
-    with open(fp, 'r') as file:
-        j = json.load(file)
-    path = get_paths(j)[0]
-    # todo: add coordinates, speed limits, expected shadow, etc. to rel. paths
-    # todo: remind user of linear interpolation in env[time] -> wind may be weird
-    # also averaging -> cannot mix incine and decline
+    fp = ROOT / "data/roadinfo/test_segment_sasolburg.geojson.pkl"
+    route = pd.read_pickle(fp)
 
-    print(path)
-    if len(path[0]) == 2:
-        # add altitude placeholder
-        path = np.column_stack([path, np.ones_like(path.T[0])*500])
-    path[2, 2] = 600.
-    print(path)
-
-    # 10kWh/km = 36'000kWs/km = 36J/m ? -> m/s * J/m = J/s = W
     # 72Wh/km = 260kWs/km = 260J/m [twike]
     # 5kWh/700km = 7Wh/km = 25.7J/m [agoria Bluepoint Atlas]
-    # E=m*g*h -> 200kg*9.81 = 1962J/m ?
+    # E=m*g*h -> 200kg*9.81 = 1962J/m
     car = Car_coeffs()
     car.v1_coeff = 36
     car.vu_coeff = 1962
     car.vd_coeff = (- car.vu_coeff) / 3  # get some back ??
 
-    start_time = datetime(2026,  9,  5, 8,  0,  0)
-    # env0 = Environment(at_time=start_time)
-    env0 = Environment()
-    env0.sun_power  = 0.
-    env0.wind_speed = 0.
-    env = [env0.to_tuple()]
-    ts = [datetime(2026, 9, 5)]
-    env = pd.DataFrame(env, index=pd.to_datetime(ts))
+    start_time = datetime(2026, 9, 5, 8, tzinfo=RACE_TZ)
+    end_time   = datetime(2026, 9, 5, 12, tzinfo=RACE_TZ)
 
-    roadinfo = []  # todo
+    ts  = pd.date_range(start_time, end_time, freq="1h")
+    env = pd.DataFrame(
+        [Environment().to_tuple()] * len(ts), index=ts)
 
-    Ws = total_Ws_for_lap(path, roadinfo, env, car, 
+    Ws = total_Ws_for_lap(route, env, car,
         start_time = start_time,
-        end_time   = datetime(2026,  9,  5, 10, 15,  0),
+        end_time   = end_time,
     )
-    print(f"E={Ws/1e3:.0f}kJ ({Ws/3600_000:.3f}kWh)")
+    print(f"{route.index[-1]/1e3:.1f}km in {end_time-start_time}: "
+          f"E={Ws/1e3:.0f}kJ ({Ws/3600_000:.3f}kWh)")
