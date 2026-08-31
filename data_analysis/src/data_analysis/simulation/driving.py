@@ -95,6 +95,7 @@ def apply_speed_limit(
             f"but are {len(distances)} and {len(limits)} respectively.")
 
     speed_lim = limits / 3.6  # km/h -> m/s
+    tot_distance = np.sum(distances)
     ideal_speed = np.sum(distances) / delta_time.total_seconds()
     speeds = np.ones(len(distances), dtype=float) * ideal_speed
 
@@ -108,7 +109,7 @@ def apply_speed_limit(
         t_free = delta_time.total_seconds() - t_lock
         if t_free < 0:
             if allow_time_overrun:
-                return limits
+                return speed_lim
             raise ValueError(
                 "cannot make journey in time due to speed limits. "
                 f"({tot_distance/1e3:.1f}km in {delta_time})")
