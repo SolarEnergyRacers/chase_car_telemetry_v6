@@ -81,7 +81,7 @@ def apply_speed_limit(
     """Calculate road segment speeds based on speed limit and target time.
     Args:
         distances: road segment lengths, in m
-        limits: expected max. speed for each segment, in km/h
+        limits: expected max. speed for each segment, in km/h (routing speed)
         delta_time: total time allocated for the road segment array
         allow_time_overrun: if True, return limits if exceeding delta_time
             instead of raising ValueError(). 
@@ -94,6 +94,12 @@ def apply_speed_limit(
             f"distances and limits must be of the same length, "
             f"but are {len(distances)} and {len(limits)} respectively.")
 
+    if np.isnan(distances).any() or np.isnan(max_speeds).any():
+        raise ValueError(
+            f"distances and max_speeds must not contain NaN "
+            f"({np.isnan(distances).sum()} / {np.isnan(max_speeds).sum()} found). "
+            f"Note the last row of a compiled route holds no segment data.")
+    
     speed_lim = limits / 3.6  # km/h -> m/s
     tot_distance = np.sum(distances)
     ideal_speed = np.sum(distances) / delta_time.total_seconds()
