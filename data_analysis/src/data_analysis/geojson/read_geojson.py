@@ -154,8 +154,8 @@ def lonlat2angular(path: list):
         d_lon = lon2 - lon1
         d_lat = lat2 - lat1
         dy = np.sin(d_lon) * np.cos(lat2)
-        dx = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(d_lat)
-        angle = np.mod(np.atan2(dx, dy), 2*np.pi)
+        dx = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(d_lon)
+        angle = np.mod(np.atan2(dy, dx), 2*np.pi)
         compass = np.rad2deg(angle)
 
         r_percent = (np.abs(lat1) / (np.pi / 2))      # crude fat-earth
