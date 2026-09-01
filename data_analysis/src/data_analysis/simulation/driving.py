@@ -1,5 +1,6 @@
 
 from   datetime import datetime, timedelta, timezone, time as daytime
+import logging as lg
 import numpy as np
 import pandas as pd
 from   pathlib import Path
@@ -27,6 +28,8 @@ from ..environment.environment   import (
 from ..ser_dataclasses import (
     Car_coeffs, Environment, ) 
 
+
+lg = lg.getLogger(__name__)
 
 RACE_TZ = ZoneInfo("Africa/Johannesburg")  # SAST, UTC+2, no DST
 
@@ -85,7 +88,8 @@ def solar_p_gen(car: Car_coeffs, irradiance):
 
 
 def drive_basis(speed: float, v_speed: float, fwd_airspeed: float = None,
-        rho: float = None, rho_ref: float = 1.02) -> np.ndarray:
+        rho: float = None, rho_ref: float = 1.02,
+        v_speed_down: float = None) -> np.ndarray:
     """Basis functions of the drive power series, in coefficient order
     (v1, v2, v3, v4, vu, vd). Units: W per unit of the respective coefficient.
 
@@ -105,6 +109,20 @@ def drive_basis(speed: float, v_speed: float, fwd_airspeed: float = None,
         rho_ref: the density `v3_coeff` was anchored/fitted at. Must be
             car.rho_ref; only defaulted here so the function stays usable
             without a Car_coeffs at hand.
+        v_speed_down: separate vertical rate for the DESCENDING part, m/s
+            (negative). None -> `v_speed` is split into its positive and
+            negative part, which is right when a segment is short enough to
+            be monotonic.
+
+    Why the split exists: the vertical energy of a segment is
+    vu_coeff * climb + vd_coeff * descent, and those are two independent
+    sums. A single net gradient per segment cannot represent a segment that
+    goes up AND down, and since climbing a metre costs 2507 J while
+    descending one returns 1692 J, collapsing a hill into its net change is
+    a one-directional error - always too optimistic. On the coarse routes
+    (nodes up to 14.8 km apart) that is worth over a kWh across the race,
+    so compile_route() sums climb and descent on the fine SRTM raster and
+    passes them here separately.
     """
     if fwd_airspeed is None:
         fwd_airspeed = speed
@@ -112,9 +130,12 @@ def drive_basis(speed: float, v_speed: float, fwd_airspeed: float = None,
     # broadcast so scalars and arrays both work: returns (6,) for scalar
     # input and (6, n) for arrays of length n, which is what lets
     # total_Ws_for_lap() and the coefficient fit run without a Python loop.
-    v, vz, a, sc = np.broadcast_arrays(
+    if v_speed_down is None:
+        v_speed_down = v_speed   # single net rate -> split by sign, as before
+    v, vz, vzd, a, sc = np.broadcast_arrays(
         np.asarray(speed,        dtype=float),
         np.asarray(v_speed,      dtype=float),
+        np.asarray(v_speed_down, dtype=float),
         np.asarray(fwd_airspeed, dtype=float),
         np.asarray(rho_scale,    dtype=float))
     v_ = np.array([
@@ -127,19 +148,20 @@ def drive_basis(speed: float, v_speed: float, fwd_airspeed: float = None,
         # must push the car, not cost energy.
         a * np.abs(a) * v * sc,
         a**4,                 # v4: no physical counterpart, coefficient is 0
-        np.maximum(vz, 0.0),  # vu: J per metre climbed
-        np.minimum(vz, 0.0),  # vd: J per metre descended (negative here, so a
+        np.maximum(vz,  0.0), # vu: J per metre climbed
+        np.minimum(vzd, 0.0), # vd: J per metre descended (negative here, so a
                               #     positive vd_coeff yields recovery)
     ])
     return v_
 
 
 def drive_power(car: Car_coeffs, speed: float, v_speed: float, fwd_airspeed:
-        float = None, rho: float = None):
+        float = None, rho: float = None, v_speed_down: float = None):
     """Battery-side drive power in W. Excludes car.aux_power, which is
     constant over time rather than distance and belongs in the energy
     integral (see total_Ws_for_lap())."""
-    v_ = drive_basis(speed, v_speed, fwd_airspeed, rho, car.rho_ref)
+    v_ = drive_basis(speed, v_speed, fwd_airspeed, rho, car.rho_ref,
+                     v_speed_down)
     M  = np.array([car.v1_coeff, car.v2_coeff, car.v3_coeff, 
         car.v4_coeff, car.vu_coeff, car.vd_coeff])
     return M @ v_   # M first, so (6,) -> scalar and (6,n) -> (n,)
@@ -325,6 +347,22 @@ def total_Ws_for_lap(
     lat        = route["latitude"   ].to_numpy()
     altitude   = route["altitude"   ].to_numpy()
     incline    = np.diff(altitude)                      # m, filtered SRTM
+    # Separate climb/descent sums per segment, summed by compile_route() on
+    # the fine SRTM raster. Without them the vertical term degrades to the
+    # net change per node pair, which on the coarse routes (nodes up to
+    # 14.8 km apart) silently discards over a kWh across the race, always
+    # in the optimistic direction.
+    has_cd = {"climb", "descent"} <= set(route.columns)
+    if has_cd:
+        climb   = route["climb"  ].to_numpy()[:-1]      # m, >= 0
+        descent = route["descent"].to_numpy()[:-1]      # m, <= 0
+    else:
+        lg.warning(
+            "route has no climb/descent columns - falling back to the net "
+            "gradient per node pair. Recompile with compile_route() for the "
+            "SRTM-raster sums; on coarse routes this underestimates the "
+            "vertical energy by a few hundred Wh per stage.")
+        climb = descent = incline
     mid_lon    = 0.5 * (lon[:-1] + lon[1:])
     mid_lat    = 0.5 * (lat[:-1] + lat[1:])
     mid_alt    = 0.5 * (altitude[:-1] + altitude[1:])   # m, for air density
@@ -348,11 +386,13 @@ def total_Ws_for_lap(
         env["wind_speed"].to_numpy() * car.wind_height_factor,
         env["wind_direction"].to_numpy(), azimuth)
     fwd_airspeed = speed + headwind
-    v_speed = incline / dt
+    v_up   = climb   / dt
+    v_down = descent / dt
     rho = air_density(mid_alt, env["temperature"].to_numpy(),
                       env["pressure_msl"].to_numpy())
 
-    p_motor = drive_power(car, speed, v_speed, fwd_airspeed, rho)
+    p_motor = drive_power(car, speed, v_up, fwd_airspeed, rho,
+                          v_speed_down=v_down)
     p_solar = solar_p_gen(car, env["ghi"].to_numpy())  # flat panel -> GHI
     Ws_seg  = dt * (p_motor + car.aux_power - p_solar)
 
@@ -366,7 +406,10 @@ def total_Ws_for_lap(
         "dt_s":         dt,
         "speed_kmh":    speed * 3.6,
         "altitude_m":   mid_alt,
-        "v_speed":      v_speed,
+        "climb_m":      climb,
+        "descent_m":    descent,
+        "v_up":         v_up,
+        "v_down":       v_down,
         "headwind":     headwind,
         "airspeed":     fwd_airspeed,
         "rho":          rho,
