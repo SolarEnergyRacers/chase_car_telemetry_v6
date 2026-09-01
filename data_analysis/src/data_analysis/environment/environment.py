@@ -657,8 +657,8 @@ def _fetch_weather_batch(
 
 if __name__ == "__main__":
     # demo: full-day weather along day N's ToControlStop + loop
-    GITHUB_ROOT = Path(__file__).parents[4]  # .../Documents/GitHub
-    day_n = 8
+    GITHUB_ROOT = Path(__file__).parents[5]  # .../Documents/GitHub
+    day_n = 1
     target_date = date.today()
     fp = GITHUB_ROOT / "strategy-private" / "route_geojson" / f"day{day_n}_route1.geojson"
     if fp.is_file():
