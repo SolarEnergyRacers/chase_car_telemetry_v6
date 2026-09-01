@@ -19,7 +19,7 @@ elif __package__ == "":
 from ..geojson.read_geojson import (
     lonlat2angular, get_paths)
 from ..environment.environment   import (
-    solar_power_gen, forward_windspeed)
+    solar_power_gen, forward_windspeed, air_density)
 from ..environment.sun_angles   import (
     calculate_SZA_from_datetime, atmospheric_travel_distance, )
 from ..ser_dataclasses import (
@@ -74,17 +74,76 @@ def solar_p_gen(car: Car_coeffs, env: Environment, tm: datetime,
             car.panel_sqm, car.panel_eff, panel_angle)
 
 
-def drive_power(car: Car_coeffs, speed: float, v_speed: float, fwd_airspeed: 
-        float = None):
+def drive_basis(speed: float, v_speed: float, fwd_airspeed: float = None,
+        rho: float = None, rho_ref: float = 1.02) -> np.ndarray:
+    """Basis functions of the drive power series, in coefficient order
+    (v1, v2, v3, v4, vu, vd). Units: W per unit of the respective coefficient.
+
+    Shared on purpose by drive_power() and the day-1 coefficient fit. The fit
+    solves `P_batt - aux_power + P_solar = drive_basis(...) @ coeffs` by least
+    squares, which only returns meaningful coefficients if the model and the
+    design matrix use the identical basis. One function is what stops the two
+    from drifting apart unnoticed.
+
+    Args:
+        speed: ground speed, m/s
+        v_speed: vertical speed, m/s (positive climbing, negative descending)
+        fwd_airspeed: airspeed along the driving direction, m/s.
+            None -> assume still air, i.e. equal to `speed`.
+        rho: local air density, kg/m^3. None -> no density scaling, the
+            coefficients are used exactly as anchored/fitted.
+        rho_ref: the density `v3_coeff` was anchored/fitted at. Must be
+            car.rho_ref; only defaulted here so the function stays usable
+            without a Car_coeffs at hand.
+    """
     if fwd_airspeed is None:
         fwd_airspeed = speed
     v = speed
     vu = v_speed if v_speed > 0 else 0
     vd = v_speed if v_speed < 0 else 0
-    v_ = np.array([v, v**2, v**3, fwd_airspeed**4, vu, vd])
+    rho_scale = 1.0 if rho is None else rho / rho_ref
+    v_ = np.array([
+        v,                    # v1: rolling resistance, force is constant
+        v**2,                 # v2: no physical counterpart, coefficient is 0
+        # v3: aerodynamic drag. Force ~ airspeed^2, power = force * ground
+        # speed, hence airspeed^2 * v and NOT v^3 (which ignored the wind
+        # entirely, since airspeed used to appear only in the v4 term).
+        # abs() preserves the sign: a tailwind stronger than the ground speed
+        # must push the car, not cost energy.
+        fwd_airspeed * abs(fwd_airspeed) * v * rho_scale,
+        fwd_airspeed**4,      # v4: no physical counterpart, coefficient is 0
+        vu,                   # vu: J per metre climbed
+        vd,                   # vd: J per metre descended (vd is negative here,
+                              #     so a positive vd_coeff yields recovery)
+    ])
+    return v_
+
+
+def drive_power(car: Car_coeffs, speed: float, v_speed: float, fwd_airspeed:
+        float = None, rho: float = None):
+    """Battery-side drive power in W. Excludes car.aux_power, which is
+    constant over time rather than distance and belongs in the energy
+    integral (see total_Ws_for_lap())."""
+    v_ = drive_basis(speed, v_speed, fwd_airspeed, rho, car.rho_ref)
     M  = np.array([car.v1_coeff, car.v2_coeff, car.v3_coeff, 
         car.v4_coeff, car.vu_coeff, car.vd_coeff])
     return v_ @ M
+
+
+def Ws_for_stop_start(car: Car_coeffs, speed: float) -> float:
+    """Net energy of one stop-start cycle in Ws: braking to a halt on
+    arrival and accelerating back to `speed` on departure.
+
+    Needs no extra parameter. vu_coeff = m*g/eta gives m/eta = vu_coeff/g,
+    and vd_coeff = m*g*eta_regen gives m*eta_regen = vd_coeff/g, so
+        E_net = 0.5 * (vu_coeff - vd_coeff) / g * speed^2
+    Assumes braking is always regenerative (team's stated practice).
+        at 72.5 km/h: 0.5 * (2507-1692) / 9.81 * 20.139^2 = 16.85 kJ = 4.68 Wh
+    About 7 stops a day (1 control stop + 6 loop stops) -> ~33 Wh.
+    Kinetic energy is otherwise absent from the model, which is correct for
+    the constant-speed segments but not across a stop.
+    """
+    return 0.5 * (car.vu_coeff - car.vd_coeff) / 9.81 * speed**2
 
 
 def apply_speed_limit(
@@ -170,6 +229,11 @@ def total_Ws_for_lap(
         delta_time: journey duration (mutually exclusive with end_time)
     Returns:
         net energy in Ws. Positive means drawn from the battery.
+        Includes car.aux_power over the journey time and, via air_density(),
+        the altitude/temperature dependence of the aerodynamic term.
+        Does NOT include stop-start losses -> add Ws_for_stop_start() per
+        control stop / loop stop, nor standing phases (no distance, so no
+        segment exists for them here).
     """
     if delta_time is None:
         if end_time is None:
@@ -200,9 +264,11 @@ def total_Ws_for_lap(
     max_speeds = route["speed_route"].to_numpy()[:-1]
     lon        = route["longitude"  ].to_numpy()
     lat        = route["latitude"   ].to_numpy()
-    incline    = np.diff(route["altitude"].to_numpy())  # m, filtered SRTM
+    altitude   = route["altitude"   ].to_numpy()
+    incline    = np.diff(altitude)                      # m, filtered SRTM
     mid_lon    = 0.5 * (lon[:-1] + lon[1:])
     mid_lat    = 0.5 * (lat[:-1] + lat[1:])
+    mid_alt    = 0.5 * (altitude[:-1] + altitude[1:])   # m, for air density
 
     speed = apply_speed_limit(distance, max_speeds, delta_time)  # m/s
     dt    = distance / speed                                     # s
@@ -226,13 +292,22 @@ def total_Ws_for_lap(
         p_solar = solar_p_gen(car, env_now, tm, mid_lat[i], mid_lon[i], 0)
         # ^ car cannot climb an incline that would matter for solar angle
 
-        wind_fwd = forward_windspeed(
+        # forward_windspeed() is POSITIVE for a headwind: wind_direction is
+        # where the wind comes FROM (meteorological convention, as delivered
+        # by Open-Meteo), azimuth is where the car goes TO, so equal angles
+        # mean driving into the wind. The airspeed the body sees is therefore
+        # the SUM. (This was a minus before, which turned every headwind into
+        # a tailwind - harmless while v3 was v**3 and the wind did not enter
+        # the physics at all, dangerous now that it does.)
+        headwind = forward_windspeed(
             env_now.wind_speed, env_now.wind_direction, azimuth[i])
-        fwd_airspeed = speed[i] - wind_fwd  # todo: check +/-
+        fwd_airspeed = speed[i] + headwind
         v_speed = incline[i] / dt[i]
+        rho = air_density(
+            mid_alt[i], env_now.temperature, env_now.pressure_msl)
 
-        p_motor = drive_power(car, speed[i], v_speed, fwd_airspeed)
-        Ws_total += dt[i] * (p_motor - p_solar)
+        p_motor = drive_power(car, speed[i], v_speed, fwd_airspeed, rho)
+        Ws_total += dt[i] * (p_motor + car.aux_power - p_solar)
 
     return Ws_total
 
@@ -241,13 +316,18 @@ if __name__ == "__main__":
     fp = ROOT / "data/roadinfo/test_segment_sasolburg.geojson.pkl"
     route = pd.read_pickle(fp)
 
-    # 72Wh/km = 260kWs/km = 260J/m [twike]
-    # 5kWh/700km = 7Wh/km = 25.7J/m [agoria Bluepoint Atlas]
-    # E=m*g*h -> 200kg*9.81 = 1962J/m
+    # Coefficients now live in Car_coeffs with their derivation in the
+    # comments there. Do NOT override them here: the old placeholders
+    # (v1_coeff = 36, vd_coeff = vu_coeff/3) silently replaced the whole
+    # calibrated set for anyone running this file directly.
     car = Car_coeffs()
-    car.v1_coeff = 36
-    car.vu_coeff = 1962
-    car.vd_coeff = (- car.vu_coeff) / 3  # get some back ??
+
+    # sanity check: does the set still reproduce the anchor it was built on?
+    # 14 Wh/km at 72.5 km/h, flat, still air, aux included.
+    v_ref = 72.5 / 3.6
+    Jm = (drive_power(car, v_ref, 0.0) + car.aux_power) / v_ref
+    print(f"anchor check: {Jm:6.2f} J/m = {Jm/3.6:5.2f} Wh/km "
+          f"at 72.5 km/h (expected 50.40 / 14.00)")
 
     start_time = datetime(2026, 9, 5, 8, tzinfo=RACE_TZ)
     end_time   = datetime(2026, 9, 5, 12, tzinfo=RACE_TZ)

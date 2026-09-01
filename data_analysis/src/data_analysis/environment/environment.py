@@ -55,8 +55,34 @@ def forward_windspeed(
     wind_direction,
     car_direction
 ):
+    """Component of the wind along the driving direction, in m/s.
+
+    wind_direction follows the meteorological convention used by Open-Meteo:
+    the direction the wind comes FROM. car_direction is the azimuth the car
+    travels TO. Equal angles therefore mean the car drives into the wind, and
+    the return value is POSITIVE for a headwind, negative for a tailwind.
+
+    Airspeed seen by the body is `ground_speed + forward_windspeed(...)`.
+    """
     angle = (car_direction - wind_direction)
     return np.cos(angle/180*np.pi)*wind_speed
+
+
+def air_density(altitude_m, temp_c, pressure_msl_pa=101325.0):
+    """Air density in kg/m^3 from route altitude and weather temperature.
+
+    Barometric formula on the ISA profile for the altitude, then ideal gas
+    with the actual temperature. Humidity is ignored (< 1 %).
+
+    Contributions over this race, for scale:
+        altitude  1480 m (Sasolburg) -> 120 m (Paarl):   18 %
+        daily temperature swing 5 °C -> 28 °C:            8 %
+        synoptic pressure (highs/lows):                 1-2 %
+    The v3 (aero) term scales linearly with this, so at 80 km/h the altitude
+    span alone is worth ~2.3 Wh/km.
+    """
+    p = pressure_msl_pa * (1.0 - 2.25577e-5 * altitude_m) ** 5.2559
+    return p / (287.05 * (temp_c + 273.15))
 
 
 # -----------------------------------------------------------------------------
@@ -86,7 +112,9 @@ DEFAULT_HOURLY_VARS = [
                                   # parked car aligning its panel to the sun
                                   # at a control stop / loop break sees.
     "wind_speed_10m",            # m/s (see wind_speed_unit in _get_api())
-    "wind_direction_10m",        # deg
+    "wind_direction_10m",        # deg, direction the wind comes FROM
+    "temperature_2m",            # deg C  - for air_density()
+    "pressure_msl",              # hPa    - for air_density(), needs *100 -> Pa
 ]
 
 if not cachedir.is_dir():
