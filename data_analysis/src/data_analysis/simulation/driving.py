@@ -19,9 +19,11 @@ elif __package__ == "":
 from ..geojson.read_geojson import (
     lonlat2angular, get_paths)
 from ..environment.environment   import (
-    solar_power_gen, forward_windspeed, air_density)
-from ..environment.sun_angles   import (
-    calculate_SZA_from_datetime, atmospheric_travel_distance, )
+    forward_windspeed, air_density, RouteWeather)
+# NOTE: sun_angles / solar_power_gen are deliberately NOT imported any more.
+# The sun elevation, the atmosphere and the cloud cover all sit inside the
+# irradiance that Open-Meteo delivers, so re-deriving them here would double
+# count. sun_angles.py stays in the tree for plotting and for sanity checks.
 from ..ser_dataclasses import (
     Car_coeffs, Environment, ) 
 
@@ -64,14 +66,22 @@ def validate_time(start: datetime, end: datetime):
     return errs
 
 
-def solar_p_gen(car: Car_coeffs, env: Environment, tm: datetime,
-        lat: float, lon: float, panel_angle: float):
-    if tm.tzinfo is None or tm.utcoffset() is None:
-        raise ValueError(f"tm must be timezone-aware (is {tm})")
-    sun_angle = calculate_SZA_from_datetime(
-        tm.astimezone(timezone.utc), lat, lon)
-    return solar_power_gen(env.sun_power, env.sun_visibility, sun_angle,
-            car.panel_sqm, car.panel_eff, panel_angle)
+def solar_p_gen(car: Car_coeffs, irradiance):
+    """Electrical power out of the array, in W. Scalar or array.
+
+    Args:
+        irradiance: W/m2 in the plane of the panel. Use
+            Environment.ghi while driving (flat-lying panel, GHI is by
+            definition the horizontal plane) and Environment.gti_tracking
+            while parked with the panel aimed at the sun.
+
+    That is the whole model. Everything optical - sun elevation, air mass,
+    cloud cover - is already inside the irradiance figure; everything
+    electrical - cell efficiency, mismatch, wiring, MPPT, soiling, cell
+    temperature - is inside car.panel_eff. See Car_coeffs.panel_eff for the
+    derivation chain of the 0.21.
+    """
+    return irradiance * car.panel_sqm * car.panel_eff
 
 
 def drive_basis(speed: float, v_speed: float, fwd_airspeed: float = None,
@@ -98,10 +108,15 @@ def drive_basis(speed: float, v_speed: float, fwd_airspeed: float = None,
     """
     if fwd_airspeed is None:
         fwd_airspeed = speed
-    v = speed
-    vu = v_speed if v_speed > 0 else 0
-    vd = v_speed if v_speed < 0 else 0
-    rho_scale = 1.0 if rho is None else rho / rho_ref
+    rho_scale = 1.0 if rho is None else np.asarray(rho, dtype=float) / rho_ref
+    # broadcast so scalars and arrays both work: returns (6,) for scalar
+    # input and (6, n) for arrays of length n, which is what lets
+    # total_Ws_for_lap() and the coefficient fit run without a Python loop.
+    v, vz, a, sc = np.broadcast_arrays(
+        np.asarray(speed,        dtype=float),
+        np.asarray(v_speed,      dtype=float),
+        np.asarray(fwd_airspeed, dtype=float),
+        np.asarray(rho_scale,    dtype=float))
     v_ = np.array([
         v,                    # v1: rolling resistance, force is constant
         v**2,                 # v2: no physical counterpart, coefficient is 0
@@ -110,11 +125,11 @@ def drive_basis(speed: float, v_speed: float, fwd_airspeed: float = None,
         # entirely, since airspeed used to appear only in the v4 term).
         # abs() preserves the sign: a tailwind stronger than the ground speed
         # must push the car, not cost energy.
-        fwd_airspeed * abs(fwd_airspeed) * v * rho_scale,
-        fwd_airspeed**4,      # v4: no physical counterpart, coefficient is 0
-        vu,                   # vu: J per metre climbed
-        vd,                   # vd: J per metre descended (vd is negative here,
-                              #     so a positive vd_coeff yields recovery)
+        a * np.abs(a) * v * sc,
+        a**4,                 # v4: no physical counterpart, coefficient is 0
+        np.maximum(vz, 0.0),  # vu: J per metre climbed
+        np.minimum(vz, 0.0),  # vd: J per metre descended (negative here, so a
+                              #     positive vd_coeff yields recovery)
     ])
     return v_
 
@@ -127,7 +142,7 @@ def drive_power(car: Car_coeffs, speed: float, v_speed: float, fwd_airspeed:
     v_ = drive_basis(speed, v_speed, fwd_airspeed, rho, car.rho_ref)
     M  = np.array([car.v1_coeff, car.v2_coeff, car.v3_coeff, 
         car.v4_coeff, car.vu_coeff, car.vd_coeff])
-    return v_ @ M
+    return M @ v_   # M first, so (6,) -> scalar and (6,n) -> (n,)
 
 
 def Ws_for_stop_start(car: Car_coeffs, speed: float) -> float:
@@ -144,6 +159,41 @@ def Ws_for_stop_start(car: Car_coeffs, speed: float) -> float:
     the constant-speed segments but not across a stop.
     """
     return 0.5 * (car.vu_coeff - car.vd_coeff) / 9.81 * speed**2
+
+
+def Ws_for_stop(
+    car: Car_coeffs,
+    weather: RouteWeather,
+    start_time: datetime,
+    duration: timedelta,
+    lat: float,
+    lon: float,
+    tracked: bool = True,
+) -> float:
+    """Net energy over a standing phase, in Ws. Negative means charged.
+
+    Distance is zero, so no route segment exists for a stop and
+    total_Ws_for_lap() cannot see it. The motor term drops out, the
+    auxiliaries keep running, and the panel keeps producing.
+
+    Args:
+        tracked: True -> panel aimed at the sun (gti_tracking), which is what
+            the team does at the 30-minute control stop. False -> panel left
+            flat (ghi).
+
+    Irradiance is sampled once, at the MIDDLE of the stop. That matches the
+    team's practice of aiming the panel once, at the sun position halfway
+    through, and not tracking afterwards: the sun moves 7.5 deg in 30
+    minutes, so +/-3.75 deg off-aim, a cosine loss of 0.21 %. Continuous
+    tracking would gain nothing measurable; aiming at all gains a lot
+    (roughly 140 Wh over the control stop versus a flat panel).
+    """
+    mid = start_time + duration / 2
+    env = Environment.from_series(
+        weather.sample([mid], [lat], [lon]).iloc[0])
+    irradiance = env.gti_tracking if tracked else env.ghi
+    p_solar = solar_p_gen(car, irradiance)
+    return duration.total_seconds() * (car.aux_power - p_solar)
 
 
 def apply_speed_limit(
@@ -212,21 +262,33 @@ def apply_speed_limit(
 
 def total_Ws_for_lap(
     route: pd.DataFrame,
-    env: pd.DataFrame,
+    weather: RouteWeather,
     car: Car_coeffs,
     start_time: datetime,
     end_time: datetime = None,
     delta_time: timedelta = None,
-) -> float:
+    return_detail: bool = False,
+):
     """Calculate net energy consumption for a route within specified time.
+
+    BREAKING CHANGE: the second argument used to be an `env` DataFrame of
+    Environment.to_tuple() rows indexed by time, i.e. one weather state for
+    the entire route. It is now a RouteWeather, which varies along the route
+    as well as over time - the reason the weather module resamples the route
+    in the first place.
+
     Args:
         route: df as provided by compile_route() / stitch_routes()
-        env: df with environment info over time, index = time (UTC).
-            Columns must match Environment.to_tuple() order.
+        weather: RouteWeather for the day, from fetch_weather_along_route().
+            Looked up by coordinate, so a stitched route with loops works
+            without a distance mapping onto the weather sample points.
         car: Car_coeffs performance parameters
-        start_time: start of journey, UTC (sun angles depend on it)
+        start_time: start of journey, UTC
         end_time: target arrival time (mutually exclusive with delta_time)
         delta_time: journey duration (mutually exclusive with end_time)
+        return_detail: if True, return a per-segment DataFrame instead of a
+            single number - the basis for an SoC trace over the day, and for
+            seeing WHERE the energy goes rather than only how much.
     Returns:
         net energy in Ws. Positive means drawn from the battery.
         Includes car.aux_power over the journey time and, via air_density(),
@@ -249,15 +311,12 @@ def total_Ws_for_lap(
     if errs := validate_time(start_time, end_time):
         raise ValueError("; ".join(errs))
 
-    n_env = len(Environment().to_tuple())
-    if env.shape[1] != n_env:
-        raise ValueError(
-            f"env must have exactly {n_env} columns matching "
-            f"Environment.to_tuple() order, but has {env.shape[1]}: "
-            f"{list(env.columns)}")
-    if env.index.tz is None:
-        raise ValueError("env.index must be timezone-aware")
-    
+    if not isinstance(weather, RouteWeather):
+        raise TypeError(
+            "weather must be a RouteWeather (from fetch_weather_along_route). "
+            "The old `env` DataFrame of Environment rows is no longer "
+            "accepted - weather now varies along the route, not only in time.")
+
     # n nodes -> n-1 segments. Last row of a compiled route holds no segment.
     distance   = route["distance"   ].to_numpy()[:-1]
     azimuth    = route["azimuth"    ].to_numpy()[:-1]
@@ -273,43 +332,52 @@ def total_Ws_for_lap(
     speed = apply_speed_limit(distance, max_speeds, delta_time)  # m/s
     dt    = distance / speed                                     # s
 
-    # segment mid-times, then one single interpolation pass over env
+    # segment mid-times, then one vectorised weather lookup for all of them
     t_mid = (start_time
         + pd.to_timedelta(np.cumsum(dt) - 0.5*dt, unit='s')).round('ms')
-    env_seg = (
-        env.reindex(env.index.union(t_mid))
-        .sort_index()
-        .bfill().ffill()  # extrapolate in zero-order hold
-        .interpolate(method="time")
-        .loc[t_mid]
-    )
+    env = weather.sample(t_mid, mid_lat, mid_lon)
 
-    Ws_total = 0.0
-    for i in range(len(distance)):
-        env_now = Environment.from_tuple(env_seg.iloc[i])
-        tm      = t_mid[i].to_pydatetime()
+    # forward_windspeed() is POSITIVE for a headwind: wind_direction is where
+    # the wind comes FROM (meteorological convention, as delivered by
+    # Open-Meteo), azimuth is where the car goes TO, so equal angles mean
+    # driving into the wind. The airspeed the body sees is therefore the SUM.
+    # (This was a minus before, which turned every headwind into a tailwind -
+    # harmless while v3 was v**3 and the wind did not enter the physics at
+    # all, dangerous now that it does.)
+    headwind = forward_windspeed(
+        env["wind_speed"].to_numpy() * car.wind_height_factor,
+        env["wind_direction"].to_numpy(), azimuth)
+    fwd_airspeed = speed + headwind
+    v_speed = incline / dt
+    rho = air_density(mid_alt, env["temperature"].to_numpy(),
+                      env["pressure_msl"].to_numpy())
 
-        p_solar = solar_p_gen(car, env_now, tm, mid_lat[i], mid_lon[i], 0)
-        # ^ car cannot climb an incline that would matter for solar angle
+    p_motor = drive_power(car, speed, v_speed, fwd_airspeed, rho)
+    p_solar = solar_p_gen(car, env["ghi"].to_numpy())  # flat panel -> GHI
+    Ws_seg  = dt * (p_motor + car.aux_power - p_solar)
 
-        # forward_windspeed() is POSITIVE for a headwind: wind_direction is
-        # where the wind comes FROM (meteorological convention, as delivered
-        # by Open-Meteo), azimuth is where the car goes TO, so equal angles
-        # mean driving into the wind. The airspeed the body sees is therefore
-        # the SUM. (This was a minus before, which turned every headwind into
-        # a tailwind - harmless while v3 was v**3 and the wind did not enter
-        # the physics at all, dangerous now that it does.)
-        headwind = forward_windspeed(
-            env_now.wind_speed, env_now.wind_direction, azimuth[i])
-        fwd_airspeed = speed[i] + headwind
-        v_speed = incline[i] / dt[i]
-        rho = air_density(
-            mid_alt[i], env_now.temperature, env_now.pressure_msl)
+    if not return_detail:
+        return float(np.sum(Ws_seg))
 
-        p_motor = drive_power(car, speed[i], v_speed, fwd_airspeed, rho)
-        Ws_total += dt[i] * (p_motor + car.aux_power - p_solar)
-
-    return Ws_total
+    cum_m = np.cumsum(distance)
+    return pd.DataFrame({
+        "time":         t_mid,
+        "cum_km":       cum_m / 1e3,
+        "dt_s":         dt,
+        "speed_kmh":    speed * 3.6,
+        "altitude_m":   mid_alt,
+        "v_speed":      v_speed,
+        "headwind":     headwind,
+        "airspeed":     fwd_airspeed,
+        "rho":          rho,
+        "ghi":          env["ghi"].to_numpy(),
+        "p_motor":      p_motor,
+        "p_aux":        car.aux_power,
+        "p_solar":      p_solar,
+        "p_net":        p_motor + car.aux_power - p_solar,
+        "Ws":           Ws_seg,
+        "Wh_cum":       np.cumsum(Ws_seg) / 3600.0,
+    })
 
 if __name__ == "__main__":
     ROOT = Path(__file__).parents[4]
@@ -329,16 +397,24 @@ if __name__ == "__main__":
     print(f"anchor check: {Jm:6.2f} J/m = {Jm/3.6:5.2f} Wh/km "
           f"at 72.5 km/h (expected 50.40 / 14.00)")
 
-    start_time = datetime(2026, 9, 5, 8, tzinfo=RACE_TZ)
-    end_time   = datetime(2026, 9, 5, 12, tzinfo=RACE_TZ)
+    start_time = datetime(2026, 9, 10, 9, tzinfo=RACE_TZ)
+    end_time   = datetime(2026, 9, 10, 13, tzinfo=RACE_TZ)
 
-    ts  = pd.date_range(start_time, end_time, freq="1h")
-    env = pd.DataFrame(
-        [Environment().to_tuple()] * len(ts), index=ts)
+    # Weather now comes from Open-Meteo for the actual route and day; this
+    # needs network access on the first run and the cache afterwards.
+    from ..environment.environment import fetch_weather_along_route
+    weather = fetch_weather_along_route(
+        fp.with_suffix(""), start_time.date(), spacing_km=5.0)
 
-    Ws = total_Ws_for_lap(route, env, car,
+    detail = total_Ws_for_lap(route, weather, car,
         start_time = start_time,
         end_time   = end_time,
+        return_detail = True,
     )
-    print(f"{route.index[-1]/1e3:.1f}km in {end_time-start_time}: "
-          f"E={Ws/1e3:.0f}kJ ({Ws/3600_000:.3f}kWh)")
+    Ws = detail["Ws"].sum()
+    km = detail["cum_km"].iloc[-1]
+    print(f"{km:.1f}km in {end_time-start_time}: "
+          f"E={Ws/1e3:.0f}kJ ({Ws/3600_000:.3f}kWh, {Ws/3600/km:.2f}Wh/km)")
+    print(f"  solar {detail['p_solar'].mul(detail['dt_s']).sum()/3600:.0f}Wh, "
+          f"motor {detail['p_motor'].mul(detail['dt_s']).sum()/3600:.0f}Wh, "
+          f"aux {detail['p_aux'].mul(detail['dt_s']).sum()/3600:.0f}Wh")

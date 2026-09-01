@@ -27,6 +27,13 @@ class Car_coeffs:
                                #  * 0.924 cell temp (-0.27 %/K * 28 K) = 0.2077
                                # bin range: 0.204 (24.9 %) .. 0.212 (25.9 %)
                                # -> peak 6.0 * 1000 * 0.208 = 1248 W
+                               # Applied to measured/forecast irradiance
+                               # (GHI driving, tracking GTI parked), so it must
+                               # NOT contain any sun-angle or cloud term - the
+                               # irradiance already does. The 28 K temperature
+                               # rise assumes near-full sun; under cloud the
+                               # cells run cooler and the true value is a few
+                               # percent higher. Second order, left flat.
                                # NOTE: only the product panel_sqm * panel_eff
                                # enters the physics; a fit can never separate
                                # them.  Kept apart for readability: panel_sqm is
@@ -76,17 +83,61 @@ class Car_coeffs:
     aux_power: float = 18.0    # W = 8 electronics + 10 daylights.  Constant over
                                # TIME, not distance -> belongs in the energy
                                # integral, not in v1 (would be infinite at standstill).
+    wind_height_factor: float = 0.65   # dimensionless. Open-Meteo delivers
+                               # wind at 10 m; the car's frontal area sits
+                               # between 0 and ~1.2 m, where the wind is
+                               # slower. Logarithmic wind profile with a
+                               # roughness length z0 = 0.05 m (open veld):
+                               #   u(1 m)/u(10 m) = ln(1/0.05) / ln(10/0.05)
+                               #                  = 3.00 / 5.30 = 0.57
+                               # taken as 0.65 for an effective height a bit
+                               # above 1 m and smoother road surroundings.
+                               # NOT a small correction: 8 m/s reported becomes
+                               # 5.2 m/s at the car, and at 72.5 km/h headwind
+                               # that is 20.2 instead of 24.4 Wh/km.
+                               # A rough terrain guess; the day-1 fit cannot
+                               # separate it from CdA, so treat it as fixed.
     wheel_circumference: float = 1.75   # m = pi * 0.557 m (outer dia., Attachment II)
                                # unloaded; loaded 2-3 % less.  Calibrate from
                                # mc_erpm vs. GPS speed on a straight run.
 
 @dataclass
 class Environment:
-    """Current state of the environment"""
-    # at_time: datetime             # time at which this applies [todo]
-    sun_power: float      = 1000. # W/m² solar power
-    sun_visibility: float = 0.99  # atmospheric effects
-    wind_speed: float     = 0.0   # m/s
+    """Environment at one point in space and time.
+
+    Field names match the keys of environment.CANONICAL_VARS, which is the
+    single place that maps them onto Open-Meteo variable names. Units are
+    already converted there (pressure in Pa).
+
+    The former clear-sky fields (sun_power, sun_visibility) are gone: GHI
+    and GTI from Open-Meteo already contain the atmosphere, the cloud cover
+    and the sun elevation, so there is nothing left to model here. Cloud
+    cover was the largest single unknown of a race day and is now data
+    rather than an assumption.
+
+    For a whole journey, use RouteWeather.sample() and work on the returned
+    DataFrame directly - it is vectorised. This dataclass is for single
+    points, defaults and hand-built scenarios ("what if it is overcast all
+    afternoon").
+    """
+    ghi: float            = 0.0   # W/m² global horizontal irradiance.
+                                  # Correct for a flat-lying panel, which is
+                                  # what the car has while driving. The slight
+                                  # curvature of the array is neglected; the
+                                  # 0.95 mismatch/curvature factor inside
+                                  # panel_eff absorbs part of it. Do not also
+                                  # apply a cosine term - GHI is horizontal.
+    gti_tracking: float   = 0.0   # W/m² on a 2-axis sun-tracking plane, i.e.
+                                  # a parked car with its panel aimed at the
+                                  # sun (control stop, loop stop). Fetched with
+                                  # tilt=azimuth=nan.
+    dni: float            = 0.0   # W/m² direct normal. Unused so far; needed
+                                  # only if plane-of-array for a tilted or
+                                  # curved panel is ever modelled.
+    dhi: float            = 0.0   # W/m² diffuse horizontal. Same.
+    wind_speed: float     = 0.0   # m/s at 10 m (Open-Meteo reference height).
+                                  # Scale by car.wind_height_factor before
+                                  # using it on the car.
     wind_direction: float = 0.0   # °, 0° = North, METEOROLOGICAL convention:
                                   # the direction the wind comes FROM. Same
                                   # angle as the car azimuth therefore means
@@ -100,17 +151,23 @@ class Environment:
                                   # synoptic variation here is only 1-2 %, but
                                   # it comes free in the same weather request.
 
-    # NOTE: to_tuple()/from_tuple() define the column ORDER that
-    # total_Ws_for_lap() expects of its `env` DataFrame. New fields are
-    # appended at the end so existing column order stays valid; an env frame
-    # built before this change has too few columns and will fail loudly on
-    # the shape check rather than silently mis-assign.
-    def to_tuple(self):  # demo workaround for interpolation
-        return (self.sun_power, self.sun_visibility, self.wind_speed,
-            self.wind_direction, self.temperature, self.pressure_msl)
+    @classmethod
+    def from_series(cls, s):
+        """Build from one row of RouteWeather.sample() (or any mapping with
+        the canonical keys). Unknown keys are ignored, absent ones keep
+        their default."""
+        obj = cls()
+        for f in cls.__dataclass_fields__:
+            if f in s:
+                setattr(obj, f, float(s[f]))
+        return obj
+
+    def to_tuple(self):
+        return tuple(getattr(self, f) for f in self.__dataclass_fields__)
+
     @classmethod
     def from_tuple(cls, data: tuple):
         obj = cls()
-        (obj.sun_power, obj.sun_visibility, obj.wind_speed,
-            obj.wind_direction, obj.temperature, obj.pressure_msl) = data
+        for f, v in zip(cls.__dataclass_fields__, data):
+            setattr(obj, f, v)
         return obj

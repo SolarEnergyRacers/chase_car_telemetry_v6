@@ -42,6 +42,16 @@ def solar_power_gen(
     panel_eff,
     panel_angle,
 ):
+    """DEPRECATED clear-sky panel model. Superseded by measured/forecast
+    irradiance from Open-Meteo: GHI already contains the atmosphere, the
+    cloud cover and the sun elevation, so neither the extinction term nor
+    the cosine term below is needed any more.
+
+    Kept only for reference and for offline experiments without weather
+    data. The energy path in driving.py uses solar_p_gen(car, irradiance),
+    i.e. `irradiance * panel_sqm * panel_eff`, with GHI while driving and
+    sun-tracking GTI while parked.
+    """
     sun_percentage = (  # negligible?
         atmospheric_travel_distance(sun_angle) /
         atmospheric_travel_distance(0))
@@ -116,6 +126,8 @@ DEFAULT_HOURLY_VARS = [
     "temperature_2m",            # deg C  - for air_density()
     "pressure_msl",              # hPa    - for air_density(), needs *100 -> Pa
 ]
+# NOTE: changing this list changes the cache key (see _cache_key()), so the
+# first run after an edit re-fetches instead of using the existing cache.
 
 if not cachedir.is_dir():
     if cachedir.exists():
@@ -163,6 +175,51 @@ def resample_route(coords: np.ndarray, spacing_km: float):
     out_lon = np.interp(target_m, cum_dist_m, lons)
     points = np.stack([out_lat, out_lon], axis=1)
     return points, target_m / 1e3
+
+
+# -----------------------------------------------------------------------------
+# weather - canonical names
+
+# Maps our field names onto Open-Meteo variable names plus a unit factor.
+# This dict is the ONLY place in the code base that knows Open-Meteo's
+# spelling; everything downstream (Environment, driving.py, the coefficient
+# fit) uses the keys on the left.
+CANONICAL_VARS = {
+    "ghi":            ("shortwave_radiation",        1.0),    # W/m2 horizontal
+    "gti_tracking":   ("global_tilted_irradiance",   1.0),    # W/m2, 2-axis
+    "dni":            ("direct_normal_irradiance",   1.0),    # W/m2
+    "dhi":            ("diffuse_radiation",          1.0),    # W/m2
+    "wind_speed":     ("wind_speed_10m",             1.0),    # m/s at 10 m
+    "wind_direction": ("wind_direction_10m",         1.0),    # deg, FROM
+    "temperature":    ("temperature_2m",             1.0),    # deg C
+    "pressure_msl":   ("pressure_msl",             100.0),    # hPa -> Pa
+}
+
+# Fallbacks used when a variable was not fetched (e.g. an older cache entry
+# without temperature/pressure). Missing variables are logged, not raised:
+# a warning is easier to act on than a KeyError deep in a simulation loop.
+CANONICAL_DEFAULTS = {
+    "ghi": 0.0, "gti_tracking": 0.0, "dni": 0.0, "dhi": 0.0,
+    "wind_speed": 0.0, "wind_direction": 0.0,
+    "temperature": 20.0, "pressure_msl": 101325.0,
+}
+
+_EPOCH = pd.Timestamp("1970-01-01", tz="UTC")
+
+
+def _epoch_seconds(idx) -> np.ndarray:
+    """Timestamps -> float seconds since the epoch, for use with np.interp.
+
+    Deliberately NOT `.astype("int64")`: pandas >= 3 keeps the unit of a
+    DatetimeIndex (us for date_range(), ns for a Timestamp plus a
+    to_timedelta()), and astype returns the raw integer in THAT unit. Mixing
+    the two silently scales one side by 1000, np.interp then clamps every
+    query to the end of the series, and the simulation quietly runs on the
+    weather of 23:00 - i.e. no sun at all. Subtracting a Timestamp and
+    taking total_seconds() is resolution independent.
+    """
+    idx = pd.DatetimeIndex(pd.to_datetime(idx, utc=True))
+    return np.asarray((idx - _EPOCH).total_seconds(), dtype=float)
 
 
 # -----------------------------------------------------------------------------
@@ -242,6 +299,94 @@ class RouteWeather:
         t0, t1 = sub.index[i0], sub.index[i1]
         frac = (t - t0) / (t1 - t0)
         return sub.iloc[i0] + (sub.iloc[i1] - sub.iloc[i0]) * frac
+
+    def sample(self, times, lats, lons) -> pd.DataFrame:
+        """Vectorised lookup for a whole simulated journey at once.
+
+        This is the path the simulation should use; .at() is the
+        single-point convenience form. Differences that matter:
+
+        * returns CANONICAL_VARS keys, not Open-Meteo spellings, with units
+          already converted (pressure in Pa, not hPa);
+        * interpolates wind as a VECTOR (u/v components) instead of
+          interpolating the direction in degrees. Linear interpolation of
+          350 deg and 10 deg gives 180 deg, i.e. exactly the opposite wind -
+          which, now that the wind actually enters drive_power(), would turn
+          a headwind into a tailwind for one hour around midnight-ish
+          direction changes;
+        * one pass per weather point instead of one DataFrame .xs() per
+          route segment, which matters because a strategy optimiser calls
+          total_Ws_for_lap() many times over a 5000-segment route.
+
+        Args:
+            times: array-like of timestamps. Naive values are read as UTC.
+            lats, lons: arrays of the same length - the position each
+                timestamp belongs to. Nearest sampled weather point wins
+                (see _nearest_distance_for_coord()); coordinates are used
+                rather than distance along the route so that stitched
+                routes and loops work without a distance mapping.
+
+        Returns:
+            pd.DataFrame with one row per input timestamp, indexed by that
+            timestamp, columns = CANONICAL_VARS keys.
+        """
+        t_idx = pd.DatetimeIndex(pd.to_datetime(times, utc=True))
+        tq = _epoch_seconds(t_idx)
+        lats = np.asarray(lats, dtype=float)
+        lons = np.asarray(lons, dtype=float)
+        if not (len(tq) == len(lats) == len(lons)):
+            raise ValueError(
+                f"times, lats and lons must be the same length, are "
+                f"{len(tq)}, {len(lats)}, {len(lons)}")
+
+        # nearest sampled weather point per query position
+        d2 = ((lats[:, None] - self.points[None, :, 0])**2
+            + (lons[:, None] - self.points[None, :, 1])**2)
+        pidx = np.argmin(d2, axis=1)
+
+        have = set(self.df.columns)
+        missing = [k for k, (col, _) in CANONICAL_VARS.items()
+                   if col not in have]
+        if missing:
+            lg.warning(
+                f"weather data has no {[CANONICAL_VARS[k][0] for k in missing]}"
+                f" - falling back to defaults for {missing}. Re-fetch with "
+                f"DEFAULT_HOURLY_VARS to get real values.")
+
+        out = {k: np.full(len(tq), CANONICAL_DEFAULTS[k], dtype=float)
+               for k in CANONICAL_VARS}
+
+        wind_ok = ("wind_speed_10m" in have) and ("wind_direction_10m" in have)
+
+        for pi in np.unique(pidx):
+            sub = self.df.xs(self.distance_km[pi], level="distance_km")
+            sub = sub.sort_index()
+            tp = _epoch_seconds(sub.index)
+            m = (pidx == pi)
+            tm = tq[m]
+
+            for key, (col, scale) in CANONICAL_VARS.items():
+                if col not in have:
+                    continue
+                if wind_ok and key in ("wind_speed", "wind_direction"):
+                    continue  # handled as a vector below
+                out[key][m] = np.interp(
+                    tm, tp, sub[col].to_numpy(dtype=float)) * scale
+
+            if wind_ok:
+                sp = sub["wind_speed_10m"].to_numpy(dtype=float)
+                dr = np.deg2rad(
+                    sub["wind_direction_10m"].to_numpy(dtype=float))
+                # meteorological "from" direction -> flow vector
+                u = -sp * np.sin(dr)
+                v = -sp * np.cos(dr)
+                ui = np.interp(tm, tp, u)
+                vi = np.interp(tm, tp, v)
+                out["wind_speed"][m] = np.hypot(ui, vi)
+                out["wind_direction"][m] = np.rad2deg(
+                    np.arctan2(-ui, -vi)) % 360.0
+
+        return pd.DataFrame(out, index=t_idx)
 
 
 # -----------------------------------------------------------------------------
