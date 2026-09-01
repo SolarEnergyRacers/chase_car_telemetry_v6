@@ -101,7 +101,7 @@ def apply_speed_limit(
             it is available for nearly every segment and reflects what
             can actually be driven.
         delta_time: total time allocated for the road segment array
-        allow_time_overrun: if True, return limits if exceeding delta_time
+        allow_time_overrun: if True, return limits if exceeding max_speeds
             instead of raising ValueError(). 
             Use with care, no notice is given if this has happened.
     Returns:
