@@ -3,6 +3,7 @@ from   datetime import datetime, timedelta, timezone, time as daytime
 import numpy as np
 import pandas as pd
 from   pathlib import Path
+from   zoneinfo import ZoneInfo
 
 # ~~~ < include dir hack > ~~~
 # normalize include dir root
@@ -25,11 +26,13 @@ from ..ser_dataclasses import (
     Car_coeffs, Environment, ) 
 
 
+RACE_TZ = ZoneInfo("Africa/Johannesburg")  # SAST, UTC+2, no DST
+
 VALID_DATERANGE = (
-    datetime(2026, 9,  3),
-    datetime(2026, 9, 17, 23, 59, 59),
+    datetime(2026, 9,  3,             tzinfo=RACE_TZ),
+    datetime(2026, 9, 17, 23, 59, 59, tzinfo=RACE_TZ),
 )
-VALID_TIMERANGE = (  # (every day)
+VALID_TIMERANGE = (  # (every day, local race time)
     daytime( 5, 0),
     daytime(23, 0),
 )   # start, end time of race -> assert that timestamps used are valid.
@@ -38,6 +41,12 @@ VALID_TIMERANGE = (  # (every day)
 
 def validate_time(start: datetime, end: datetime):
     errs = []
+    for name, t in (("start", start), ("end", end)):
+        if t.tzinfo is None or t.utcoffset() is None:
+            errs.append(f"{name} time must be timezone-aware (is {t})")
+    if errs:
+        return errs  # further comparisons would raise TypeError
+
     if not (VALID_DATERANGE[0] <= start <= VALID_DATERANGE[1]):
         errs.append(f"start time must be between {VALID_DATERANGE[0]} "
             f"and {VALID_DATERANGE[1]} (is {start})")
@@ -45,10 +54,13 @@ def validate_time(start: datetime, end: datetime):
         errs.append(f"end time must be between {VALID_DATERANGE[0]} "
             f"and {VALID_DATERANGE[1]} (is {end})")
 
-    if not (end.time() <= VALID_TIMERANGE[1]):
-        errs.append(f"end time {end} is after race end.")
-    if not (start.time() >= VALID_TIMERANGE[0]):
-        errs.append(f"start time {start} is before race start.")
+    # compare wall clock time in race local timezone, not in the given one
+    start_local = start.astimezone(RACE_TZ)
+    end_local   = end.astimezone(RACE_TZ)
+    if not (end_local.time() <= VALID_TIMERANGE[1]):
+        errs.append(f"end time {end_local} is after race end.")
+    if not (start_local.time() >= VALID_TIMERANGE[0]):
+        errs.append(f"start time {start_local} is before race start.")
     return errs
 
 
@@ -77,14 +89,17 @@ def drive_power(car: Car_coeffs, speed: float, v_speed: float, fwd_airspeed:
 
 def apply_speed_limit(
     distances: np.array,
-    limits: np.array, 
+    max_speeds: np.array,
     delta_time: timedelta,
     allow_time_overrun: bool = False
 ) -> np.ndarray:
     """Calculate road segment speeds based on speed limit and target time.
     Args:
         distances: road segment lengths, in m
-        limits: expected max. speed for each segment, in km/h (routing speed)
+        max_speeds: expected achievable speed for each segment, in km/h.
+            Use routing speed (speed_route) rather than the legal limit:
+            it is available for nearly every segment and reflects what
+            can actually be driven.
         delta_time: total time allocated for the road segment array
         allow_time_overrun: if True, return limits if exceeding delta_time
             instead of raising ValueError(). 
@@ -92,10 +107,10 @@ def apply_speed_limit(
     Returns:
         array of speed values corresponding to each road segment
     """
-    if not len(distances) == len(limits):
+    if not len(distances) == len(max_speeds):
         raise ValueError(
-            f"distances and limits must be of the same length, "
-            f"but are {len(distances)} and {len(limits)} respectively.")
+            f"distances and max_speeds must be of the same length, "
+            f"but are {len(distances)} and {len(max_speeds)} respectively.")
 
     if np.isnan(distances).any() or np.isnan(max_speeds).any():
         raise ValueError(
@@ -103,9 +118,9 @@ def apply_speed_limit(
             f"({np.isnan(distances).sum()} / {np.isnan(max_speeds).sum()} found). "
             f"Note the last row of a compiled route holds no segment data.")
     
-    speed_lim = limits / 3.6  # km/h -> m/s
+    speed_lim = max_speeds / 3.6  # km/h -> m/s
     tot_distance = np.sum(distances)
-    ideal_speed = np.sum(distances) / delta_time.total_seconds()
+    ideal_speed = tot_distance / delta_time.total_seconds()
     speeds = np.ones(len(distances), dtype=float) * ideal_speed
 
     maxiter = 0
@@ -170,6 +185,15 @@ def total_Ws_for_lap(
     if errs := validate_time(start_time, end_time):
         raise ValueError("; ".join(errs))
 
+    n_env = len(Environment().to_tuple())
+    if env.shape[1] != n_env:
+        raise ValueError(
+            f"env must have exactly {n_env} columns matching "
+            f"Environment.to_tuple() order, but has {env.shape[1]}: "
+            f"{list(env.columns)}")
+    if env.index.tz is None:
+        raise ValueError("env.index must be timezone-aware")
+    
     # n nodes -> n-1 segments. Last row of a compiled route holds no segment.
     distance   = route["distance"   ].to_numpy()[:-1]
     azimuth    = route["azimuth"    ].to_numpy()[:-1]
@@ -213,7 +237,7 @@ def total_Ws_for_lap(
     return Ws_total
 
 if __name__ == "__main__":
-    ROOT = Path(__file__).parents[3]
+    ROOT = Path(__file__).parents[4]
     fp = ROOT / "data/roadinfo/test_segment_sasolburg.geojson.pkl"
     route = pd.read_pickle(fp)
 

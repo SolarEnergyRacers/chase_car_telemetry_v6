@@ -86,11 +86,11 @@ def get_info(file: Path) -> dict:
     return info
 
 
-def get_speed(info: dict) -> list(tuple):
+def get_speed(info: dict) -> list[tuple]:
     """get speed from valhalla info dict
     Args:
         info: dict provided by valhalla api for one LineString
-   Returns:
+    Returns:
             list of (speed, speed_limit) for every point in the LineString,
             taken from the edge each point was matched onto. Points sit
             mid-edge (median distance_along_edge ~0.5), so where the edge
