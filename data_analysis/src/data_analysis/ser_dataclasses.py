@@ -41,7 +41,14 @@ class Car_coeffs:
                                # one (MPPT currents vs. GHI, day 1).
     battery_cap: float = 2879  # Wh = 6P * 4.30 Ah (rated min @10 A) * 31S * 3.6 V
                                #    = 25.80 Ah * 111.6 V = 2879.3
+                               # SUPERSEDED by Battery_coeffs below, which
+                               # gets the same number from the OCV curve
+                               # (2909 Wh) instead of V_nom * Ah.  Kept only
+                               # so existing callers do not break; new code
+                               # must use battery.capacity_wh(batt).  Two
+                               # numbers for one pack is how they drift apart.
     battery_usable: float = 0.90   # fraction of battery_cap planned as usable.
+                               # SUPERSEDED by Battery_coeffs.usable.
                                # 2879 * 0.90 = 2591 Wh.  Separate field on
                                # purpose: day 8 (finish 15:00) may go deeper
                                # than day 1.  BMS cut-off and the weakest cell
@@ -171,3 +178,79 @@ class Environment:
         for f, v in zip(cls.__dataclass_fields__, data):
             setattr(obj, f, v)
         return obj
+
+
+@dataclass(frozen=True)
+class Battery_coeffs:
+    """Constant parameters of the battery pack.
+
+    Frozen so it can key the cached energy curve in simulation/battery.py.
+    Build a modified pack with dataclasses.replace(batt, usable=0.95).
+
+    Everything here is per CELL except serial_cells / parallel_cells /
+    pack_r_extra_ohm / usable.  Samsung INR21700-45T, datasheet in the
+    project.
+    """
+
+    serial_cells:   int = 31    # -> 111.6 V nominal
+    parallel_cells: int = 6
+
+    cell_capacity_ah: float = 4.30  # Ah.  Datasheet 3.2 "rated discharge
+                               # capacity", min 4300 mAh, measured at a 10 A
+                               # discharge.  Datasheet 3.1 gives typ 4500 /
+                               # min 4400 mAh at 0.2 C.  The car draws about
+                               # 1000 W at 72.5 km/h = 9 A pack = 1.5 A per
+                               # cell = 0.33 C, far closer to the 0.2 C test
+                               # than to the 10 A one, so 4.30 is conservative
+                               # by roughly 4 % (~120 Wh on the pack).
+                               # ESTIMATE either way: cells that have cycled
+                               # lose capacity, and the datasheet only
+                               # guarantees 60 % after 250 cycles at 35 A.
+                               # A capacity test is the only way to settle it.
+    v_nominal_cell: float = 3.6   # V, datasheet 3.3.  Used only for the
+                               # nominal-Wh comparison, never for energy.
+
+    cell_r_i_ohm: float = 0.015   # ohm, DC internal resistance per cell.
+                               # GUESSED: this datasheet does not state a DC
+                               # or AC IR.  0.010-0.016 is the usual range for
+                               # a 45T.  Enters the OCV correction linearly:
+                               # at 25 A pack it is 1.55 V (R=0.012) to 2.58 V
+                               # (R=0.020) of pack sag, and on the plateau
+                               # 10 mV per cell is 1.3 % SoC - so this one
+                               # number is worth several percent of SoC.
+    pack_r_extra_ohm: float = 0.010  # ohm, everything the cells are not:
+                               # busbars, fuse, contactors, shunt, wiring to
+                               # the voltage sense point.  GUESSED placeholder.
+                               # Measurable in five minutes from telemetry:
+                               # V at rest minus V under a known load, divided
+                               # by the current, minus cell_r_i * S / P.
+                               # Do that before trusting any voltage-based SoC.
+
+    # Open-circuit voltage over state of charge, one cell.  Taken over from
+    # SER_strategy_sosol_2026/myFunctions.py unchanged, so results stay
+    # comparable to the old notebooks.  It is a GENERIC li-ion curve, not the
+    # 45T: end points match (2.5 V cut-off, 4.2 V full) but the plateau shape
+    # is where the error sits, and the plateau is most of the race.  Replace
+    # with the 0.2 C discharge curve digitised from the datasheet figure,
+    # shifted by I*R_i to get OCV, or with a slow discharge of the real pack.
+    ocv_soc: tuple = (0.0, 0.02, 0.10, 0.30, 0.50, 0.70, 0.90, 1.0)
+    ocv_v:   tuple = (2.5, 3.0,  3.3,  3.5,  3.65, 3.8,  4.0,  4.2)
+
+    usable: float = 0.90       # fraction of pack energy the strategy may
+                               # plan with.  ESTIMATE.  The real floor is set
+                               # by the BMS cut-off and the weakest cell, not
+                               # by the 2.5 V datasheet value.  Day 8 (finish
+                               # 15:00) may justify going deeper than day 1.
+
+    temp_note: str = ("resistance and capacity are taken at room temperature. "
+                      "Cell R_i roughly doubles near 0 C; a Highveld start at "
+                      "5 C therefore sags more than this model says, and the "
+                      "first hour of the day is the worst case.")
+
+    @property
+    def capacity_ah(self) -> float:
+        return self.cell_capacity_ah * self.parallel_cells
+
+    @property
+    def v_nominal(self) -> float:
+        return self.v_nominal_cell * self.serial_cells
