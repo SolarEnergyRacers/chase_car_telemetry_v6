@@ -23,7 +23,8 @@ elif __package__ == "":
 # ~~~ </include dir hack > ~~~
 
 from .sun_angles import *
-from ..geojson.read_geojson import resolve_geo_to_coords, lonlat2angular
+from ..geojson.read_geojson import (
+    resolve_geo_to_coords, lonlat2angular, check_coords)
 
 if __name__ == "__main__":
     # demo run, see below
@@ -161,6 +162,7 @@ def resample_route(coords: np.ndarray, spacing_km: float):
                 matching fetch_weather()'s argument order).
             distance_km: (M,) cumulative distance from the route start, km.
     """
+    check_coords(coords, "lonlat", "resample_route(coords)")
     deltas = lonlat2angular(coords)  # [compass, distance_m, (rise)] per seg.
     seg_dist_m = deltas[:, 1]
     cum_dist_m = np.concatenate([[0.0], np.cumsum(seg_dist_m)])
@@ -278,6 +280,8 @@ class RouteWeather:
             if lat is None or lon is None:
                 raise ValueError(
                     "give either distance_km, or both lat and lon")
+            check_coords([lat, lon], "latlon",
+                         "RouteWeather.at(lat=, lon=)")
             distance_km = self._nearest_distance_for_coord(lat, lon)
         elif lat is not None or lon is not None:
             raise ValueError(
@@ -338,6 +342,8 @@ class RouteWeather:
             raise ValueError(
                 f"times, lats and lons must be the same length, are "
                 f"{len(tq)}, {len(lats)}, {len(lons)}")
+        check_coords(np.column_stack([lats, lons]), "latlon",
+                     "RouteWeather.sample(lats, lons)")
 
         # nearest sampled weather point per query position
         d2 = ((lats[:, None] - self.points[None, :, 0])**2
@@ -632,6 +638,10 @@ def _fetch_weather_batch(
     day = _coerce_date(day)
     if variables is None:
         variables = DEFAULT_HOURLY_VARS
+    # checked here rather than in the public wrappers: this is the last
+    # place before _cache_key(), so a swapped pair cannot poison the
+    # cache with weather from the wrong hemisphere either.
+    check_coords(points, "latlon", "Open-Meteo query points")
 
     archive = _is_archive_date(day)
     key = _cache_key(points, day, variables, tilt, azimuth)

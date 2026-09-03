@@ -10,6 +10,95 @@ lg = logging.getLogger(__name__)
 
 # todo: test featureCollection
 
+# -----------------------------------------------------------------------------
+# coordinate order guard
+
+# Bounding box of the race, in degrees. Reason this exists: inside South
+# Africa a swapped coordinate pair stays formally valid. (lat -26, lon 27)
+# swapped is (lat 27, lon -26) - both within -90..90 / -180..180, so
+# neither Open-Meteo nor the GPS API rejects it, and the only symptom is
+# weather from the wrong continent. Checking against the race area instead
+# of the globe is what turns that silent error into a loud one.
+#
+# Widen it for test data from elsewhere, or set COORD_BBOX = None to
+# disable the check entirely.
+COORD_BBOX = {
+    "lat": (-35.5, -22.0),   # Cape Town ~ -33.9 ... Johannesburg ~ -26.1
+    "lon": ( 16.0,  33.5),   # Cape Town ~  18.4 ... Johannesburg ~  28.0
+}
+
+
+def _bbox_inside(lat, lon):
+    """Elementwise: is (lat, lon) inside COORD_BBOX? NaN counts as inside,
+    so a route with gaps still passes and fails later where it matters."""
+    lat_lo, lat_hi = COORD_BBOX["lat"]
+    lon_lo, lon_hi = COORD_BBOX["lon"]
+    ok_lat = ~np.isfinite(lat) | ((lat >= lat_lo) & (lat <= lat_hi))
+    ok_lon = ~np.isfinite(lon) | ((lon >= lon_lo) & (lon <= lon_hi))
+    return ok_lat & ok_lon
+
+
+def check_coords(coords, order: str, what: str = "coords"):
+    """Verify that coordinates are in the axis order the caller expects.
+
+    Call this at every boundary where the axis order changes or where
+    coordinates enter an external API - GeoJSON is [lon, lat, (alt)],
+    Open-Meteo and GPS are (lat, lon), and nothing but this check stands
+    between the two.
+
+    Args:
+        coords: (N,2), (N,3) or a single [x, y, (alt)] pair. Extra columns
+            (altitude, azimuth, ...) are ignored.
+        order: 'lonlat' for GeoJSON-style data, 'latlon' for
+            Open-Meteo/GPS-style data.
+        what: name used in the error message, e.g. the file or function
+            the coordinates came from.
+
+    Returns:
+        `coords` unchanged, so the call can wrap an expression.
+
+    Raises:
+        ValueError: a coordinate lies outside COORD_BBOX. The message says
+            whether swapping the two axes would fix it, which is the
+            common cause.
+    """
+    if order not in ("lonlat", "latlon"):
+        raise ValueError(
+            f"order must be 'lonlat' or 'latlon', but is '{order}'")
+    if COORD_BBOX is None:
+        return coords
+
+    arr = np.asarray(coords, dtype=float)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        raise ValueError(
+            f"{what}: expected (N,2) or (N,3) coordinates, "
+            f"got shape {np.shape(coords)}")
+
+    if order == "lonlat":
+        lon, lat = arr[:, 0], arr[:, 1]
+    else:
+        lat, lon = arr[:, 0], arr[:, 1]
+
+    bad = ~_bbox_inside(lat, lon)
+    if not bad.any():
+        return coords
+
+    idx = int(np.flatnonzero(bad)[0])
+    msg = (
+        f"{what}: {int(bad.sum())} of {len(lat)} coordinates lie outside "
+        f"the race bounding box (lat {COORD_BBOX['lat']}, "
+        f"lon {COORD_BBOX['lon']}); first at index {idx}: "
+        f"lat={lat[idx]:.5f}, lon={lon[idx]:.5f}")
+    if _bbox_inside(lon, lat)[bad].all():
+        other = "latlon" if order == "lonlat" else "lonlat"
+        msg += (
+            f". They all fit when the two axes are swapped, so the data is "
+            f"probably '{other}' while '{order}' was expected")
+    raise ValueError(msg)
+
+
 
 def _get_feature(feat: dict):
     if not "type" in feat:
