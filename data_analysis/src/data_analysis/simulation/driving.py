@@ -478,11 +478,11 @@ if __name__ == "__main__":
     car = Car_coeffs()
 
     # sanity check: does the set still reproduce the anchor it was built on?
-    # 14 Wh/km at 72.5 km/h, flat, still air, aux included.
-    v_ref = 72.5 / 3.6
+    # 14 Wh/km at 60 km/h, flat, still air, aux included.
+    v_ref = 60.0 / 3.6
     Jm = (drive_power(car, v_ref, 0.0) + car.aux_power) / v_ref
     print(f"anchor check: {Jm:6.2f} J/m = {Jm/3.6:5.2f} Wh/km "
-          f"at 72.5 km/h (expected 50.40 / 14.00)")
+          f"at 60 km/h (expected 50.40 / 14.00)")
 
     start_time = datetime(2026, 9, 10, 9, tzinfo=RACE_TZ)
     end_time   = datetime(2026, 9, 10, 13, 30, tzinfo=RACE_TZ)

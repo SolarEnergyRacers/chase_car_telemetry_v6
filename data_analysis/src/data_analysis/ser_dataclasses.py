@@ -62,12 +62,14 @@ class Car_coeffs:
                                # Crr = 0.004 is GUESSED, no published value for
                                # the Bridgestone RA01AZ.  Only free number left.
     v2_coeff: float = 0.0      # no physical counterpart (power ~ v²)
-    v3_coeff: float = 0.0973   # from the anchor: (49.506 - 10.028) / 20.139²
-                               #   = 39.478 / 405.58 = 0.09734
-                               # equals 0.5 * rho_ref * CdA / eta, so
-                               # implied CdA = 0.0973 * 0.90 * 2 / rho_ref
-                               #             = 0.17514 / 1.02 = 0.172 m²
-                               # Term is airspeed² * v, NOT v³ (see drive_power).
+    v3_coeff: float = 0.1415    # Anker 14 Wh/km bei 60 km/h:
+                                 #   (14*3.6 - 18/16.667 - 10.028) / 16.667^2
+                                 #   = 39.292 / 277.78
+                                 # implizites CdA = 0.1415*0.90*2/1.02 = 0.250 m2
+                                 # Der Anker ist ein ERINNERTER Wert, keine Messung.
+                                 # 0.250 m2 ist fuer diese Klasse hoch (typisch
+                                 # 0.10-0.15), also bewusst pessimistisch. Die
+                                 # Unsicherheit ist eine Groessenordnung, kein Prozent.
     v4_coeff: float = 0.0      # no physical counterpart (power ~ airspeed⁴)
     vu_coeff: float = 2507     # J per metre climbed: m * g / eta
                                #   = 230 * 9.81 / 0.90 = 2507.0
