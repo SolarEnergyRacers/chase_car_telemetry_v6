@@ -218,6 +218,11 @@ def Ws_for_stop(
     return duration.total_seconds() * (car.aux_power - p_solar)
 
 
+_T_TOL = 1e-6   # s. Slack on the time budget in apply_speed_limit(), so that
+                # a journey requested at exactly its minimum time succeeds
+                # instead of failing on float noise.
+
+
 def apply_speed_limit(
     distances: np.array,
     max_speeds: np.array,
@@ -262,12 +267,22 @@ def apply_speed_limit(
         speeds = np.where(mask, speed_lim, speeds)
         t_lock = np.sum(distances[mask] / speeds[mask])
         t_free = delta_time.total_seconds() - t_lock
-        if t_free < 0:
+        if t_free < -_T_TOL:
             if allow_time_overrun:
                 return speed_lim
             raise ValueError(
                 "cannot make journey in time due to speed limits. "
                 f"({tot_distance/1e3:.1f}km in {delta_time})")
+        if t_free <= _T_TOL:
+            # every segment is at its cap and the budget is exactly the
+            # minimum time. That is feasible, not a failure - and it is a
+            # case that turns up whenever a caller splits a longer journey
+            # into parts and hands each part the time the whole solution
+            # gave it: the slowest part comes out fully locked, so its share
+            # IS its minimum, to within float noise. Without this branch the
+            # next line divides by ~0 and the iteration diverges into the
+            # ValueError above.
+            return np.where(mask, speed_lim, speed_lim)
         # d_free = np.sum(np.where(~mask, distances, 0))
         d_free = np.sum(distances[~mask])
         ideal_speed = d_free / t_free
@@ -290,6 +305,7 @@ def total_Ws_for_lap(
     end_time: datetime = None,
     delta_time: timedelta = None,
     return_detail: bool = False,
+    speeds: np.ndarray = None,
 ):
     """Calculate net energy consumption for a route within specified time.
 
@@ -319,7 +335,32 @@ def total_Ws_for_lap(
         control stop / loop stop, nor standing phases (no distance, so no
         segment exists for them here).
     """
-    if delta_time is None:
+    if speeds is not None:
+        # A caller that has already allocated speeds over a WHOLE day cannot
+        # hand each part a time budget and expect the same answer back: a
+        # part that comes out fully capped sits exactly at its minimum time,
+        # and re-solving it is at best redundant and at worst a rounding
+        # error away from "not feasible". So take the speeds as given and
+        # derive the duration from them - one allocation, used everywhere,
+        # which is the same reason drive_basis() is shared with the fit.
+        speeds = np.asarray(speeds, dtype=float)
+        n_seg = len(route) - 1
+        if len(speeds) != n_seg:
+            raise ValueError(
+                f"speeds has {len(speeds)} entries, route has {n_seg} "
+                f"segments ({len(route)} nodes)")
+        if (speeds <= 0).any():
+            raise ValueError("speeds must all be positive")
+        derived = timedelta(seconds=float(np.sum(
+            route["distance"].to_numpy()[:-1] / speeds)))
+        if delta_time is not None and abs(
+                (delta_time - derived).total_seconds()) > 1.0:
+            lg.warning(
+                "speeds imply %s but delta_time says %s - using the speeds",
+                derived, delta_time)
+        delta_time = derived
+        end_time = start_time + delta_time
+    elif delta_time is None:
         if end_time is None:
             raise ValueError(
                 "Must specify either end_time or delta_time (neither given)")
@@ -367,7 +408,10 @@ def total_Ws_for_lap(
     mid_lat    = 0.5 * (lat[:-1] + lat[1:])
     mid_alt    = 0.5 * (altitude[:-1] + altitude[1:])   # m, for air density
 
-    speed = apply_speed_limit(distance, max_speeds, delta_time)  # m/s
+    if speeds is None:
+        speed = apply_speed_limit(distance, max_speeds, delta_time)  # m/s
+    else:
+        speed = speeds
     dt    = distance / speed                                     # s
 
     # segment mid-times, then one vectorised weather lookup for all of them
@@ -441,10 +485,8 @@ if __name__ == "__main__":
           f"at 72.5 km/h (expected 50.40 / 14.00)")
 
     start_time = datetime(2026, 9, 10, 9, tzinfo=RACE_TZ)
-    end_time   = datetime(2026, 9, 10, 13, tzinfo=RACE_TZ)
+    end_time   = datetime(2026, 9, 10, 13, 30, tzinfo=RACE_TZ)
 
-    # Weather now comes from Open-Meteo for the actual route and day; this
-    # needs network access on the first run and the cache afterwards.
     from ..environment.environment import fetch_weather_along_route
     weather = fetch_weather_along_route(
         fp.with_suffix(""), start_time.date(), spacing_km=5.0)
