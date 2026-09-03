@@ -102,11 +102,47 @@ def day_for_today(today: date = None) -> int:
     return day_n
 
 
-def cache_day(day_n: int, route_dir: Path) -> None:
+def cache_age(fp: Path, target: date) -> str:
+    """How old the cached snapshot for one route part is.
+
+    Read from `_fetched_at` inside the payload rather than from the file's
+    mtime: an mtime does not survive a copy, a zip or a git checkout, and
+    the age is the one number that stops someone planning on last week's
+    clouds.
+    """
+    from data_analysis.environment.environment import (
+        _cache_key, _is_archive_date, cachedir)
+    from data_analysis.geojson.read_geojson import resolve_geo_to_coords
+    from data_analysis.environment.environment import resample_route
+    import json
+    from datetime import datetime, timezone
+
+    coords = resolve_geo_to_coords(fp, altitude="drop")
+    points, _ = resample_route(coords, SPACING_KM)
+    key = _cache_key(points, target, list(DEFAULT_HOURLY_VARS),
+                     float("nan"), float("nan"))
+    archive = _is_archive_date(target)
+    fn = cachedir / (key if archive else f"{key}_latest")
+    if not fn.is_file():
+        return "nicht im Cache"
+    try:
+        payload = json.load(fn.open("r"))
+        first = payload[0] if isinstance(payload, list) else payload
+        ts = datetime.strptime(first["_fetched_at"], "%Y%m%dT%H%M%SZ")
+    except (OSError, KeyError, ValueError, TypeError):
+        return "im Cache, Abrufzeit unbekannt"
+    age = datetime.now(timezone.utc) - ts.replace(tzinfo=timezone.utc)
+    hours = age.total_seconds() / 3600
+    return f"geholt vor {int(hours)}h{int((hours % 1) * 60):02d}"
+
+
+def cache_day(day_n: int, route_dir: Path, refresh: bool = False,
+              status_only: bool = False) -> None:
     target = date_for_day(day_n)
     ahead = (target - date.today()).days
     log.info(f"=== day {day_n}, {target} ({ahead:+d} days from today), "
-             f"spacing {SPACING_KM} km")
+             f"spacing {SPACING_KM} km"
+             + ("  [REFRESH]" if refresh else ""))
 
     for stem in ROUTE_PARTS[day_n]:
         fp = route_dir / f"{stem}.geojson"
@@ -114,18 +150,64 @@ def cache_day(day_n: int, route_dir: Path) -> None:
             log.warning(f"  {stem}: no file - blind stage not published yet, "
                         f"or this day has no such part")
             continue
-        weather = fetch_weather_along_route(
-            fp, target, spacing_km=SPACING_KM, variables=DEFAULT_HOURLY_VARS)
+        if status_only:
+            log.info(f"  {stem}: {cache_age(fp, target)}")
+            continue
+        before = cache_age(fp, target)
+        try:
+            weather = fetch_weather_along_route(
+                fp, target, spacing_km=SPACING_KM,
+                variables=DEFAULT_HOURLY_VARS, refresh=refresh)
+        except Exception as e:
+            # A refresh without network must not take the workflow down.
+            # The old snapshot is still perfectly usable - it is just old,
+            # and saying so is the whole point of the age line.
+            if refresh and "nicht im Cache" not in before:
+                log.warning(f"  {stem}: Refresh fehlgeschlagen ({type(e).__name__}"
+                            f": {str(e)[:80]}) - alter Stand bleibt, {before}")
+                continue
+            log.error(f"  {stem}: kein Wetter verfuegbar "
+                      f"({type(e).__name__}: {str(e)[:80]})")
+            continue
         log.info(f"  {stem}: {float(weather.distance_km[-1]):6.1f} km, "
                  f"{len(weather.distance_km):3d} points, "
-                 f"{len(weather.df):5d} rows")
+                 f"{len(weather.df):5d} rows  "
+                 f"({before} -> {cache_age(fp, target)})")
+
+
+USAGE = """usage: cache_weather.py [1..8 | all] [--refresh] [--status]
+
+  (no day)     today's race day
+  1..8         that race day
+  all          all eight days
+  --day N      same as the positional form
+
+  --refresh    fetch from the API even if something is already cached.
+               WITHOUT THIS NOTHING IS REFETCHED - a cache hit is returned
+               as-is, however old it is.
+  --status     only report what is cached and how old it is, no requests
+  -v           verbose
+"""
 
 
 def main(argv=None) -> None:
-    argv = sys.argv if argv is None else argv
-    arg = argv[1].lower() if len(argv) > 1 else None
+    argv = list(sys.argv if argv is None else argv)
+    flags = {a.lower() for a in argv[1:] if a.startswith("-")}
+    if flags & {"-h", "--help"}:
+        print(USAGE)
+        return
+    refresh = bool(flags & {"-r", "--refresh", "--force"})
+    status_only = bool(flags & {"-s", "--status"})
 
-    if arg in ("all", "-a", "--all"):
+    # positional day, or --day N
+    rest = [a for a in argv[1:] if not a.startswith("-")]
+    if "--day" in [a.lower() for a in argv[1:]]:
+        i = [a.lower() for a in argv].index("--day")
+        if i + 1 < len(argv):
+            rest = [argv[i + 1]]
+    arg = rest[0].lower() if rest else None
+
+    if arg in ("all", "a"):
         days = list(range(1, N_DAYS + 1))
     elif arg is None:
         days = [day_for_today()]
@@ -133,12 +215,17 @@ def main(argv=None) -> None:
         try:
             days = [int(arg)]
         except ValueError:
-            raise SystemExit(f"usage: {Path(argv[0]).name} [1..{N_DAYS}|all]")
+            raise SystemExit(USAGE)
+    if not all(1 <= d <= N_DAYS for d in days):
+        raise SystemExit(USAGE)
 
     route_dir = find_route_dir()
     log.info(f"routes from {route_dir}")
     for day_n in days:
-        cache_day(day_n, route_dir)
+        cache_day(day_n, route_dir, refresh=refresh, status_only=status_only)
+    if not refresh and not status_only:
+        log.info("nothing was refetched where a snapshot already existed - "
+                 "use --refresh for a newer model run")
 
 
 if __name__ == "__main__":
