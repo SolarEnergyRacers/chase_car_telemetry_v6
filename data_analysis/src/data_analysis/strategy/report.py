@@ -98,18 +98,21 @@ def header(state, weathers: dict, solar_check: dict = None) -> str:
 def options_table(opts: list, batt=None) -> str:
     """The decision: one row per remaining loop count."""
     L = ["", f"{'Loops':>5} {'km':>7} {'Ø km/h':>7} {'min SOC':>8} "
-             f"{'End-SOC':>8} {'Wh ü.Boden':>11} {'Zeitreserve':>12}"]
+             f"{'End-SOC':>8} {'Wh ü.Boden':>11} {'Zeitreserve':>12} "
+             f"{'Wechsel':>8}"]
     last_ok = None
     for o in opts:
         if not o.feasible:
             L.append(f"{o.n_loops:>5} {o.km:>7.1f} "
-                     f"{'—':>7} {'—':>8} {'—':>8} {'—':>11} {'—':>12}")
+                     f"{'—':>7} {'—':>8} {'—':>8} {'—':>11} {'—':>12} "
+                     f"{'—':>8}")
             L.append(f"        nicht machbar: {o.reason}")
             break
         last_ok = o
         L.append(f"{o.n_loops:>5} {o.km:>7.1f} {o.avg_kmh:>7.1f} "
                  f"{o.min_soc*100:>7.0f} % {o.end_soc*100:>7.0f} % "
-                 f"{o.wh_above_floor:>+11.0f} {_hm(o.reserve):>12}"
+                 f"{o.wh_above_floor:>+11.0f} {_hm(o.reserve):>12} "
+                 f"{len(o.driver_changes):>8}"
                  + (f"   {o.wh_spilled:>5.0f} Wh verworfen"
                     if o.wh_spilled > 5 else ""))
 
@@ -199,6 +202,13 @@ def speed_zones(opt, max_per_leg: int = 3, min_km: float = 3.0):
             rows.append({
                 "leg":    g["leg"].iloc[0],
                 "bis_km": float(g["km_total"].iloc[b - 1]),
+                # position within the leg as well as the running total.
+                # On a loop the leg value is the useful one - "km 16.6 of
+                # 22.6" says where you are, "km 189.4" does not - and at a
+                # control stop the running total is what matches the
+                # options table.
+                "leg_km": float(dist[:b].sum()) / 1e3,
+                "leg_len": float(dist.sum()) / 1e3,
                 "km":     dd / 1e3,
                 "v_kmh":  5.0 * round((dd / max(tt, 1e-9) * 3.6) / 5.0),
                 "an":     g["time"].iloc[b - 1],
@@ -212,6 +222,7 @@ def speed_zones(opt, max_per_leg: int = 3, min_km: float = 3.0):
         grp = keep.cumsum()
         out = out.groupby(grp, as_index=False).agg(
             leg=("leg", "first"), bis_km=("bis_km", "last"),
+            leg_km=("leg_km", "last"), leg_len=("leg_len", "first"),
             km=("km", "sum"), v_kmh=("v_kmh", "first"), an=("an", "last"))
     return out
 
@@ -236,10 +247,12 @@ def plan_text(opt, state) -> str:
     for _, kind, r in items:
         if kind == "drive":
             if r["leg"] != last_leg:
-                L.append(f"  {r['leg']}")
+                L.append(f"  {r['leg']}  ({r['leg_len']:.1f} km)")
                 last_leg = r["leg"]
-            L.append(f"    bis km {r['bis_km']:>6.1f}  {r['v_kmh']:>3.0f} km/h"
-                     f"  ({r['km']:>5.1f} km)      an {_clock(r['an'])}")
+            L.append(f"    bis km {r['bis_km']:>6.1f}"
+                     f"   im Leg {r['leg_km']:>5.1f}"
+                     f"   {r['v_kmh']:>3.0f} km/h"
+                     f"  ({r['km']:>5.1f} km)   an {_clock(r['an'])}")
         else:
             wh = -r["Ws"] / 3600.0
             L.append(f"  {r['leg']:<22} {r['dt_s']/60:>4.0f} min  "
@@ -259,8 +272,19 @@ def plan_text(opt, state) -> str:
     L.append(f"SOC       Start {state.pack.soc*100:.0f} % → Ende "
              f"{opt.end_soc*100:.0f} %, Minimum {opt.min_soc*100:.0f} % "
              f"({opt.wh_above_floor:+.0f} Wh ueber dem Boden)")
-    L.append(f"Zeit      Ankunft {_clock(opt.trace['time'].iloc[-1])}, "
+    # end of the LAST row, not its start: with the regulation floor active
+    # the last row is usually the leftover standing phase, and its start is
+    # when the driving ends - not when the line is crossed
+    t_end = (opt.trace["time"].iloc[-1]
+             + timedelta(seconds=float(opt.trace["dt_s"].iloc[-1])))
+    L.append(f"Zeit      Ziellinie {_clock(t_end)}, "
              f"Reserve bei Vollgas {_hm(opt.reserve)}")
+    n_dc = len(opt.driver_changes)
+    L.append(f"Stehen    {_hm(opt.stop_time)} gesamt, davon "
+             f"{n_dc} Fahrerwechsel"
+             + (f" (bei km "
+                + ", ".join(f"{s.km:.0f}" for s in opt.driver_changes) + ")"
+                if n_dc else ""))
 
     if opt.capped_km > 0:
         L.append(f"Modell    Routing-Deckel bindet auf {opt.capped_km:.1f} km"
@@ -305,6 +329,59 @@ def floor_alternative(opt) -> str:
             f"{freed.total_seconds()/60:.0f} min stehend laden. Ob das auch "
             f"energetisch besser ist, haengt an der Tageszeit - mit "
             f"--stop KM:{freed.total_seconds()/60:.0f} nachrechnen")
+
+
+def sweep_text(rows: list, batt, km: float, wh_ceiling: float = None) -> str:
+    """The standing-phase sweep as a table, with the useful row marked.
+
+    "morgen nutzbar" is min(end energy, ceiling): energy above the next
+    morning's ceiling is worthless, since it would have arrived free in the
+    morning window anyway. Which is why the best row is often NOT the one
+    with the highest end SoC.
+    """
+    from data_analysis.simulation.battery import capacity_wh
+    cap = capacity_wh(batt)
+
+    where = (f"{abs(km):.1f} km vor dem Ziel" if km < 0
+             else f"km {km:.1f}")
+    L = ["", f"Standladen {where}, Dauer variiert"]
+    L.append(f"{'Dauer':>7} {'Ø km/h':>7} {'Ende':>7} {'min SOC':>8} "
+             f"{'verworfen':>10} {'Ladung':>9} {'morgen nutzbar':>15}")
+
+    best, best_val = None, -1.0
+    for minutes, o in rows:
+        if not o.feasible:
+            L.append(f"{minutes:>5} min  nicht machbar: "
+                     f"{o.reason.split(':')[0]}")
+            break
+        s = o.trace[o.trace["leg"].astype(str).str.startswith("Standladen")]
+        wh = -float(s["Ws"].sum()) / 3600.0 if len(s) else 0.0
+        usable = min(o.end_wh, wh_ceiling) if wh_ceiling else o.end_wh
+        # 30 Wh is about one SoC point. A longer halt means faster
+        # driving, so it always costs minimum SoC on the way - and buying
+        # a noise-level gain with real margin is the wrong trade. Anything
+        # under a point counts as a tie, and ties go to the shorter halt.
+        if usable > best_val + 30.0:
+            best, best_val = minutes, usable
+        L.append(f"{minutes:>5} min {o.avg_kmh:>7.1f} {o.end_soc*100:>6.0f} % "
+                 f"{o.min_soc*100:>7.0f} % {o.wh_spilled:>9.0f} "
+                 f"{wh:>8.0f} Wh {usable:>12.0f} Wh")
+
+    if best is None:
+        return "\n".join(L)
+
+    L.append("")
+    if wh_ceiling:
+        L.append(f"Obergrenze morgen {wh_ceiling:.0f} Wh "
+                 f"({100*wh_ceiling/cap:.0f} %) - darueber ist der Gewinn "
+                 f"morgen frueh ohnehin weg")
+    L.append(f"Bestes Verhaeltnis: {best} min "
+             f"({best_val:.0f} Wh morgen nutzbar; Gewinne unter 30 Wh "
+             f"gelten als gleichwertig)")
+    L.append("Beachte: laengeres Stehen heisst schneller fahren, also "
+             "tieferer minimaler SOC unterwegs - weniger Reserve gegen "
+             "Bewoelkung.")
+    return "\n".join(L)
 
 
 def trigger_text(opts: list, state) -> str:

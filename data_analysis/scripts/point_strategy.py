@@ -28,6 +28,7 @@ import sys
 
 import numpy as np
 
+from data_analysis.simulation.battery import capacity_wh
 from data_analysis.ser_dataclasses import Battery_coeffs, Car_coeffs
 from data_analysis.strategy import dayplan, inputs, report
 from data_analysis.strategy.inputs import RACE_TZ
@@ -291,6 +292,49 @@ def parts_needed(part: str) -> tuple:
     }[part]
 
 
+def load_morning(day: int, rc, spacing_km: float, car, batt, wh_end):
+    """The next morning's charge window, or None if it cannot be computed.
+
+    The overnight stop is the same place as the NEXT day's first route
+    point, so the location and the weather both come from day+1 - and the
+    weather has to be for day+1's date, not today's.
+
+    Returns None rather than raising: a missing next-day cache entry means
+    "cannot say", not "the plan is wrong". It is the last day, or nobody
+    has cached tomorrow yet.
+    """
+    from data_analysis.strategy import dayplan
+
+    nxt = day + 1
+    if str(nxt) not in rc.config["days"]:
+        log.info("Tag %d ist der letzte Renntag - kein Morgenfenster", day)
+        return None
+    try:
+        _, routes = load_routes(nxt)
+        if "to_control" not in routes:
+            log.info("Tag %d: Route noch nicht veroeffentlicht - kein "
+                     "Morgenfenster", nxt)
+            return None
+        nxt_date = date.fromisoformat(rc.config["days"][str(nxt)]["date"])
+        w = load_weathers(nxt, nxt_date, ("to_control",), spacing_km)
+        if "to_control" not in w:
+            return None
+    except SystemExit as e:
+        log.info("kein Morgenfenster: %s", str(e).splitlines()[0])
+        return None
+
+    first = routes["to_control"].iloc[0]
+    t_start_next, _ = rc.day_window(nxt)
+    release = t_start_next.replace(hour=6, minute=0, second=0, microsecond=0)
+    if release >= t_start_next:
+        log.info("Tag %d startet um %s - kein Fenster vor dem Start",
+                 nxt, t_start_next.strftime("%H:%M"))
+        return None
+    return dayplan.morning_charge(
+        w["to_control"].weather, float(first["latitude"]),
+        float(first["longitude"]), release, t_start_next, car, batt, wh_end)
+
+
 def load_weathers(day: int, day_date, which: tuple, spacing_km: float):
     """Cached weather for the named route parts. Cache-only, see inputs."""
     route_dir = inputs.find_route_dir()
@@ -340,14 +384,31 @@ def parse_args(argv=None):
                         "Optionstabelle")
     g.add_argument("--stop", action="append", default=[], metavar="KM:MIN",
                    help="Standladen: km ab hier und Dauer in Minuten, "
-                        "mehrfach erlaubt")
+                        "mehrfach erlaubt. Negative km zaehlen vom Ziel "
+                        "zurueck, dann mit Gleichheitszeichen schreiben: "
+                        "--stop=-5:30 sind 30 min ab 5 km vor dem Ziel "
+                        "(ohne = haelt argparse das Minus fuer eine Option)")
+    g.add_argument("--driver-change", action="append", default=[],
+                   dest="driver_change", metavar="KM|@HH:MM",
+                   help="Fahrerwechsel erzwingen, bei km oder zu einer "
+                        "Uhrzeit (@14:30). Mehrfach erlaubt")
+    g.add_argument("--no-auto-driver-change", action="store_true",
+                   dest="no_auto_dc",
+                   help="die automatischen Wechsel alle 2 h weglassen")
+    g.add_argument("--sweep-stop", type=float, dest="sweep_stop",
+                   metavar="KM",
+                   help="Standladen an dieser Stelle in 15-min-Schritten "
+                        "durchrechnen und die Ausbeute vergleichen. "
+                        "Negative km zaehlen vom Ziel zurueck, dann mit "
+                        "Gleichheitszeichen: --sweep-stop=-1")
     g.add_argument("--n-max", type=int, default=6, dest="n_max")
-    g.add_argument("--plot", nargs="?", const="strategie", metavar="PREFIX",
-                   help="beide Anzeigen als PNG schreiben (SOC-Plot und "
-                        "Strecke-Zeit-Diagramm). Ohne --plan wird die "
-                        "beste machbare Option geplottet")
-    g.add_argument("--show", action="store_true",
-                   help="Plots zusaetzlich in einem Fenster anzeigen")
+    g.add_argument("--plot", action="store_true",
+                   help="beide Anzeigen in einem Fenster oeffnen (zoomen, "
+                        "verschieben, speichern). Ohne --plan wird die beste "
+                        "machbare Option geplottet")
+    g.add_argument("--plot-png", nargs="?", const="strategie",
+                   metavar="PREFIX", dest="plot_png",
+                   help="Anzeigen zusaetzlich als PNG schreiben")
     g.add_argument("--spacing-km", type=float, default=5.0,
                    dest="spacing_km",
                    help="muss dem Wert in cache_weather.py entsprechen, "
@@ -415,13 +476,37 @@ def main(argv=None) -> int:
         loop_leg=leg, loop_done=loops_done, position_source=pos_src,
         cross_track_m=cross, notes=notes)
 
+    # --stop KM:MIN, where a negative KM counts back from the end of the
+    # day. rsplit, because "-5:30" has the minus in front of the km.
     extra_stops = []
     for s in args.stop:
         try:
-            a, b = s.split(":")
-            extra_stops.append((float(a), float(b)))
+            a, b = s.rsplit(":", 1)
+            extra_stops.append(dayplan.StopSpec(km=float(a),
+                                                minutes=float(b)))
         except ValueError:
             raise SystemExit(f"--stop erwartet KM:MIN, bekommen {s!r}")
+
+    forced_dc = []
+    for s in args.driver_change:
+        try:
+            if s.startswith("@"):
+                tt = inputs.attach_date(inputs.resolve_time(s[1:]), day_date)
+                forced_dc.append(dayplan.StopSpec(
+                    at_time=tt,
+                    minutes=dayplan.DRIVER_CHANGE.total_seconds() / 60,
+                    label=dayplan.DRIVER_CHANGE_LABEL, tracked_min=0.0))
+            else:
+                forced_dc.append(dayplan.StopSpec(
+                    km=float(s),
+                    minutes=dayplan.DRIVER_CHANGE.total_seconds() / 60,
+                    label=dayplan.DRIVER_CHANGE_LABEL, tracked_min=0.0))
+        except ValueError:
+            raise SystemExit(f"--driver-change erwartet km oder @HH:MM, "
+                             f"bekommen {s!r}")
+
+    ev = dict(extra_stops=extra_stops, driver_changes=forced_dc,
+              auto_driver_change=not args.no_auto_dc)
 
     print()
     print(f"=== Tag {day}, {day_date:%d.%m.%Y}, Fenster "
@@ -430,24 +515,48 @@ def main(argv=None) -> int:
 
     plotted = None
 
+    if args.sweep_stop is not None:
+        # which loop count to sweep at: the one asked for, otherwise the
+        # best feasible one - sweeping a count that cannot be driven
+        # anyway would only produce a column of "nicht machbar"
+        n = args.plan
+        if n is None:
+            feas = [o for o in dayplan.options(state, parts, car, batt,
+                                               n_max=args.n_max, **ev)
+                    if o.feasible]
+            if not feas:
+                raise SystemExit("keine machbare Option - nichts zu sweepen")
+            n = feas[-1].n_loops
+            print(f"\nkeine --plan angegeben, gesweept wird die beste "
+                  f"machbare Option: {n} Loop(s)")
+        rows = dayplan.sweep_stop(state, parts, n, car, batt,
+                                  args.sweep_stop, **ev)
+        ceiling = None
+        first_ok = next((o for _, o in rows if o.feasible), None)
+        if first_ok is not None:
+            mc = load_morning(day, rc, args.spacing_km, car, batt,
+                              first_ok.end_wh)
+            if mc is not None:
+                ceiling = mc.wh_max_arrival
+        print(report.sweep_text(rows, batt, args.sweep_stop, ceiling))
+        return 0
+
     if part == "to_finish" and args.plan is None:
         # the loops are driven at the control stop; past it the only
         # remaining question is how to pace the run to the finish. An
         # options table would print the same row n+1 times.
         print("\nLoops sind nach dem Kontrollstopp nicht mehr moeglich - "
               "es bleibt der Weg zum Ziel.")
-        opt = dayplan.evaluate(state, parts, 0, car, batt,
-                               extra_stops=extra_stops)
+        opt = dayplan.evaluate(state, parts, 0, car, batt, **ev)
         print(report.plan_text(opt, state))
         plotted = opt
     elif args.plan is not None:
-        opt = dayplan.evaluate(state, parts, args.plan, car, batt,
-                               extra_stops=extra_stops)
+        opt = dayplan.evaluate(state, parts, args.plan, car, batt, **ev)
         print(report.plan_text(opt, state))
         plotted = opt
     else:
         opts = dayplan.options(state, parts, car, batt, n_max=args.n_max,
-                               extra_stops=extra_stops)
+                               **ev)
         if part == "loop":
             print("\nLoops = noch zu fahrende Loops NACH dem laufenden. "
                   "0 heisst: diesen beenden und zum Ziel.")
@@ -458,13 +567,29 @@ def main(argv=None) -> int:
         ok = [o for o in opts if o.feasible]
         plotted = ok[-1] if ok else None      # die beste machbare Option
 
-    if args.plot and plotted is not None and plotted.feasible:
-        from data_analysis.strategy import plots
-        files = plots.write_both(plotted, state, batt, args.plot,
-                                 interactive=args.show)
-        print("\nPlots: " + ", ".join(f for f in files if f))
-    elif args.plot:
-        print("\nKein Plot: die gewaehlte Option ist nicht machbar.")
+    if (args.plot or args.plot_png):
+        if plotted is None or not plotted.feasible:
+            print("\nKein Plot: die gewaehlte Option ist nicht machbar.")
+        else:
+            from data_analysis.strategy import plots
+            mc = load_morning(day, rc, args.spacing_km, car, batt,
+                              plotted.end_wh)
+            if mc is not None:
+                print(f"\nMorgenfenster Tag {day+1}: angeboten "
+                      f"{mc.offered:.0f} Wh, aufgenommen {mc.absorbed:.0f} Wh"
+                      + (f", verworfen {mc.spilled:.0f} Wh"
+                         if mc.spilled > 1 else "")
+                      + f"\n                     Ankunft ohne Verlust bis "
+                        f"{mc.wh_max_arrival:.0f} Wh "
+                        f"({100*mc.wh_max_arrival/capacity_wh(batt):.0f} %) "
+                        f"- tiefer ist nicht schlechter, nur mehr gefahren")
+            files = plots.render(plotted, state, batt,
+                                 png_prefix=args.plot_png, show=args.plot,
+                                 morning=mc)
+            if files:
+                print("\nPNG: " + ", ".join(files))
+            elif args.plot:
+                print("\nPlotfenster geschlossen.")
     return 0
 
 
