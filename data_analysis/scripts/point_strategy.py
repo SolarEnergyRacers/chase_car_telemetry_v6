@@ -442,7 +442,7 @@ def parse_args(argv=None):
                         "durchrechnen und die Ausbeute vergleichen. "
                         "Negative km zaehlen vom Ziel zurueck, dann mit "
                         "Gleichheitszeichen: --sweep-stop=-1")
-    g.add_argument("--n-max", type=int, default=6, dest="n_max")
+    g.add_argument("--n-max", type=int, default=10, dest="n_max")
     g.add_argument("--plot", action="store_true",
                    help="beide Anzeigen in einem Fenster oeffnen (zoomen, "
                         "verschieben, speichern). Ohne --plan wird die beste "
