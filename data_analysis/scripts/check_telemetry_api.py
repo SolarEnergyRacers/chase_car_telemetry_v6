@@ -249,6 +249,7 @@ def parse_gps_json(text: str):
             continue
         lower = {k.lower(): v for k, v in raw.items()}
         out.append({
+            "id": lower.get("id"),
             "time": parse_iso(str(lower.get("timestamp", ""))),
             "time_raw": lower.get("timestamp"),
             "lat": lower.get("latitude"),
@@ -532,6 +533,19 @@ def report_gps(host: str, start: datetime, end, device: str, timeout: float) -> 
             print("                Odometer immer den Namen des Autos setzen.")
 
 
+def poll_gps(host: str, device: str, timeout: float):
+    """Holt den letzten Fix fuer ein Geraet. Gibt (Status, Punkt|None) zurueck."""
+    _, status, body = get(host, "/api/gps/latest", {"deviceName": device},
+                          timeout, verbose=False)
+    if status != 200:
+        return status, None
+    try:
+        points = parse_gps_json(body)
+    except json.JSONDecodeError:
+        return status, None
+    return status, points[0] if points else None
+
+
 # ---------------------------------------------------------------- Selbsttest
 
 class Checks:
@@ -727,15 +741,25 @@ def run_watch(args) -> None:
     from = letzter gesehener Zeitstempel + 1 s, kein to. Das ueberlappende
     Fenster frueherer Fassungen ist damit unnoetig; die Deduplizierung bleibt
     trotzdem drin, weil from inklusiv ist und ein Abruf zweimal losgehen kann.
+
+    GPS wird pro Durchgang einmal ueber /api/gps/latest geholt und auf einer
+    eigenen Zeile ausgegeben - Position, Geschwindigkeit, Alter des Fix und die
+    seit Beginn aufsummierte Strecke. Letztere ist die Groesse, an der spaeter
+    der Odometer haengt, also lohnt es, sie schon im Test zu sehen.
     """
     series = args.series or ",".join(STRATEGY_SERIES)
     print(f"Livebetrieb: alle {args.interval:g} s ab dem letzten Stand, kein 'to'.")
     print(f"Reihen: {series}")
+    if not args.no_gps:
+        print(f"GPS: /api/gps/latest?deviceName={args.device}")
     print("Abbruch mit Strg+C.\n")
 
     cursor = datetime.now(timezone.utc) - timedelta(seconds=args.backfill)
     seen_until = 0
     total = 0
+    gps_last = None          # letzter Fix mit anderer Id
+    gps_km = 0.0
+    gps_quiet = False        # 404 nur einmal ausfuehrlich melden
 
     try:
         while True:
@@ -756,12 +780,14 @@ def run_watch(args) -> None:
                 time.sleep(args.interval)
                 continue
 
+            can_speed = None
             fresh = [(ts, values) for ts, values in rows if ts > seen_until]
             if fresh:
                 seen_until = fresh[-1][0]
                 cursor = datetime.fromtimestamp(seen_until, timezone.utc) + timedelta(seconds=1)
                 total += len(fresh)
                 timestamp, values = fresh[-1]
+                can_speed = values.get("speed")
                 shown = [c for c in columns if any(v.get(c) is not None for _, v in rows)]
                 snapshot = "  ".join(
                     f"{c}={'-' if values.get(c) is None else format(values[c], '.1f')}"
@@ -772,9 +798,57 @@ def run_watch(args) -> None:
             else:
                 print(f"{now:%H:%M:%S}  keine neuen Sekunden (gesamt {total})")
 
+            if not args.no_gps:
+                gps_status, point = poll_gps(args.host, args.device, args.timeout)
+                if point is None:
+                    if not gps_quiet:
+                        print(f"          GPS  kein Fix fuer '{args.device}' "
+                              f"(HTTP {gps_status}) - ungefiltert pruefen, ob ueberhaupt")
+                        print("               Punkte ankommen; sonst fehlt 'device' in der")
+                        print("               OsmAnd-URL und jeder Punkt wird abgewiesen.")
+                        gps_quiet = True
+                    else:
+                        print(f"          GPS  weiterhin kein Fix (HTTP {gps_status})")
+                else:
+                    gps_quiet = False
+                    # Neuer Fix? Bevorzugt ueber die Id, ersatzweise ueber den
+                    # Zeitstempel - falls eine kuenftige Antwort ohne Id kommt.
+                    def fix_key(p):
+                        return p.get("id") if p.get("id") is not None else p.get("time_raw")
+
+                    is_new = gps_last is None or fix_key(point) != fix_key(gps_last)
+                    if (is_new and gps_last is not None
+                            and point["lat"] is not None and gps_last["lat"] is not None):
+                        gps_km += haversine_km(gps_last["lat"], gps_last["lon"],
+                                               point["lat"], point["lon"])
+                    if is_new:
+                        gps_last = point
+
+                    if point["time"] is None:
+                        age_text = "Fix ohne Zone"
+                        fix_age = None
+                    else:
+                        fix_age = (now - point["time"]).total_seconds()
+                        age_text = f"Fix {fix_age:.0f} s alt"
+                        if fix_age > args.gps_stale:
+                            age_text += "  ACHTUNG"
+
+                    speed_text = ("-" if point["speed"] is None
+                                  else f"{float(point['speed']):.1f} km/h")
+                    # Der Vergleich mit der CAN-Geschwindigkeit lohnt nur, wenn der
+                    # Fix frisch ist - sonst vergleicht man zwei Zeitpunkte.
+                    if (can_speed is not None and point["speed"] is not None
+                            and fix_age is not None and fix_age <= 5):
+                        delta = float(point["speed"]) - can_speed
+                        speed_text += f" (CAN {can_speed:.0f}, delta {delta:+.1f})"
+
+                    print(f"          GPS  {point['lat']:.6f}, {point['lon']:.6f}   "
+                          f"{speed_text}   {age_text}   +{gps_km:.3f} km seit Start")
+
             time.sleep(args.interval)
     except KeyboardInterrupt:
-        print(f"\nBeendet. {total} Sekunden empfangen.")
+        print(f"\nBeendet. {total} Sekunden empfangen"
+              + (f", {gps_km:.3f} km aus GPS-Fixes." if not args.no_gps else "."))
 
 
 # ---------------------------------------------------------------- CLI
@@ -817,6 +891,8 @@ def parse_args() -> argparse.Namespace:
                         help="Watch: Abstand in s (Default 10)")
     parser.add_argument("--backfill", type=float, default=120.0,
                         help="Watch: Sekunden, die beim Start nachgeladen werden (Default 120)")
+    parser.add_argument("--gps-stale", type=float, default=30.0, metavar="S",
+                        help="Watch: ab diesem Alter gilt ein Fix als veraltet (Default 30 s)")
     parser.add_argument("--selftest", action="store_true",
                         help="Konformitaetspruefungen der API")
     parser.add_argument("--timeout", type=float, default=30.0,

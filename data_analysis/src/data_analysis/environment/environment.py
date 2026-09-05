@@ -531,6 +531,37 @@ def fetch_weather_along_route(
 # -----------------------------------------------------------------------------
 # weather - private
 
+def fetch_weather_at_point(
+    lat: float,
+    lon: float,
+    day,
+    variables: list = None,
+    tilt: float = float("nan"),
+    azimuth: float = float("nan"),
+    refresh: bool = False,
+) -> RouteWeather:
+    """Weather for a single place, wrapped as a one-point RouteWeather.
+
+    For places that are not on a route: the overnight stop, whose weather
+    is needed for the NEXT day's date while the next day's route may not
+    exist yet (blind stages). A RouteWeather rather than a bare frame
+    because Ws_for_stop() and everything else downstream take one.
+
+    Goes through _fetch_weather_batch(), so the cache and the
+    backward-mean re-timing apply exactly as they do for a route.
+    """
+    day = _coerce_date(day)
+    points = np.asarray([[float(lat), float(lon)]], dtype=float)
+    dfs = _fetch_weather_batch(points, day, variables, tilt, azimuth,
+                               refresh=refresh)
+    df = _centre_backward_means(dfs[0].copy())
+    df.index.name = "time"
+    df["distance_km"] = 0.0
+    df = df.set_index("distance_km", append=True)
+    df = df.reorder_levels(["distance_km", "time"])
+    return RouteWeather(df.sort_index(), points, np.array([0.0]))
+
+
 def _centre_backward_means(df: pd.DataFrame) -> pd.DataFrame:
     """Re-time the backward-averaged radiation columns to interval centres.
 

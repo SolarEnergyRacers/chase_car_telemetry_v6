@@ -136,6 +136,63 @@ def cache_age(fp: Path, target: date) -> str:
     return f"geholt vor {int(hours)}h{int((hours % 1) * 60):02d}"
 
 
+def overnight_point(day_n: int, route_dir: Path):
+    """Last coordinate of a day's route - where the car spends the night.
+
+    Same place as the next day's first route point, but available a day
+    earlier. That matters on the blind stages, where the next day's route
+    does not exist yet and the morning charge window would otherwise be
+    impossible to compute.
+    """
+    from data_analysis.geojson.read_geojson import resolve_geo_to_coords
+
+    for stem in reversed(ROUTE_PARTS[day_n]):
+        if "loop" in stem:
+            continue
+        fp = route_dir / f"{stem}.geojson"
+        if not fp.is_file():
+            continue
+        coords = resolve_geo_to_coords(fp, altitude="drop")
+        # resolve_geo_to_coords() returns GeoJSON order, [lon, lat].
+        # resample_route() swaps to [lat, lon], and everything downstream -
+        # RouteWeather.points, the cache key, Ws_for_stop - is [lat, lon].
+        # Taking the raw coordinates unswapped cached the overnight point
+        # at a mirrored position, so the key never matched the one the
+        # strategy looks up and the entry was written but never found.
+        return float(coords[-1][1]), float(coords[-1][0])
+    return None
+
+
+def cache_night(day_n: int, route_dir: Path, refresh: bool = False,
+                status_only: bool = False) -> None:
+    """Cache the overnight stop for the NEXT day's date.
+
+    One point, one day. Tiny next to a route fetch, and it is what makes
+    the morning window computable on a blind stage.
+    """
+    from data_analysis.environment.environment import fetch_weather_at_point
+
+    if day_n >= N_DAYS:
+        return
+    here = overnight_point(day_n, route_dir)
+    if here is None:
+        log.warning(f"  Nachtquartier Tag {day_n}: keine Route gefunden")
+        return
+    target = date_for_day(day_n + 1)
+    if status_only:
+        log.info(f"  Nachtquartier {here[0]:.4f},{here[1]:.4f} fuer {target}: "
+                 f"siehe Cache")
+        return
+    try:
+        fetch_weather_at_point(here[0], here[1], target, DEFAULT_HOURLY_VARS,
+                               refresh=refresh)
+        log.info(f"  Nachtquartier {here[0]:.4f},{here[1]:.4f} fuer {target} "
+                 f"(Morgenfenster Tag {day_n + 1})")
+    except Exception as e:
+        log.warning(f"  Nachtquartier Tag {day_n}: {type(e).__name__}: "
+                    f"{str(e)[:70]}")
+
+
 def cache_day(day_n: int, route_dir: Path, refresh: bool = False,
               status_only: bool = False) -> None:
     target = date_for_day(day_n)
@@ -223,6 +280,8 @@ def main(argv=None) -> None:
     log.info(f"routes from {route_dir}")
     for day_n in days:
         cache_day(day_n, route_dir, refresh=refresh, status_only=status_only)
+        cache_night(day_n, route_dir, refresh=refresh,
+                    status_only=status_only)
     if not refresh and not status_only:
         log.info("nothing was refetched where a snapshot already existed - "
                  "use --refresh for a newer model run")

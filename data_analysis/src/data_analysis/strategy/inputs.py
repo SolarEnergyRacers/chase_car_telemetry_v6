@@ -315,6 +315,31 @@ def _fetched_at_from_cache(key: str, archive: bool):
         return None, fn.name
 
 
+def load_point_weather(lat: float, lon: float, day: date,
+                       variables: list = None) -> CachedWeather:
+    """One place, one day, FROM CACHE ONLY. See load_weather().
+
+    Used for the overnight stop: its weather is needed for the next day's
+    date, and the next day's route may not be published yet.
+    """
+    from ..environment.environment import fetch_weather_at_point
+
+    variables = list(variables or DEFAULT_HOURLY_VARS)
+    points = np.asarray([[float(lat), float(lon)]], dtype=float)
+    key = _cache_key(points, day, variables, float("nan"), float("nan"))
+    archive = _is_archive_date(day)
+
+    if _get_cache(key, archive) is None:
+        raise SystemExit(
+            f"Cache-Miss: Punkt {lat:.4f},{lon:.4f} fuer {day} nicht im "
+            f"Cache.\n  Abrufen: python scripts/cache_weather.py")
+
+    weather = fetch_weather_at_point(lat, lon, day, variables=variables)
+    fetched_at, fn = _fetched_at_from_cache(key, archive)
+    return CachedWeather(weather=weather, fetched_at=fetched_at,
+                         cache_file=fn, stem=f"{lat:.4f},{lon:.4f}")
+
+
 def load_weather(geo, day: date, spacing_km: float = 5.0,
                  variables: list = None, tilt: float = float("nan"),
                  azimuth: float = float("nan"),

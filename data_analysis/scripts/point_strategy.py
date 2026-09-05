@@ -292,47 +292,88 @@ def parts_needed(part: str) -> tuple:
     }[part]
 
 
-def load_morning(day: int, rc, spacing_km: float, car, batt, wh_end):
-    """The next morning's charge window, or None if it cannot be computed.
+def overnight_point(routes: dict):
+    """Where the car spends the night: the last node of the day's route.
 
-    The overnight stop is the same place as the NEXT day's first route
-    point, so the location and the weather both come from day+1 - and the
-    weather has to be for day+1's date, not today's.
+    Same place as the NEXT day's first route point, but known a day
+    earlier - which is the whole reason to take it from here. On a blind
+    stage the next day's route does not exist yet, and deriving the
+    overnight stop from it made the morning window disappear exactly on
+    the days where it is hardest to plan.
+    """
+    for which in ("to_finish", "to_control"):
+        if which in routes:
+            last = routes[which].iloc[-1]
+            return float(last["latitude"]), float(last["longitude"])
+    return None
 
-    Returns None rather than raising: a missing next-day cache entry means
-    "cannot say", not "the plan is wrong". It is the last day, or nobody
-    has cached tomorrow yet.
+
+def load_morning(day: int, rc, routes: dict, spacing_km: float, car, batt,
+                 wh_end):
+    """The next morning's charge window at the overnight stop.
+
+    Location from TODAY's route end; weather for TOMORROW's date at that
+    point. Falls back to the next day's first route point where the point
+    entry has not been cached, so older caches keep working.
+
+    Returns (MorningCharge | None, note). Never raises: no morning window
+    is "cannot say", not "the plan is wrong". But it says WHY - a window
+    that vanishes without a word is the same failure mode as a weather
+    cache that silently refuses to refresh.
     """
     from data_analysis.strategy import dayplan
 
     nxt = day + 1
     if str(nxt) not in rc.config["days"]:
-        log.info("Tag %d ist der letzte Renntag - kein Morgenfenster", day)
-        return None
-    try:
-        _, routes = load_routes(nxt)
-        if "to_control" not in routes:
-            log.info("Tag %d: Route noch nicht veroeffentlicht - kein "
-                     "Morgenfenster", nxt)
-            return None
-        nxt_date = date.fromisoformat(rc.config["days"][str(nxt)]["date"])
-        w = load_weathers(nxt, nxt_date, ("to_control",), spacing_km)
-        if "to_control" not in w:
-            return None
-    except SystemExit as e:
-        log.info("kein Morgenfenster: %s", str(e).splitlines()[0])
-        return None
-
-    first = routes["to_control"].iloc[0]
+        return None, f"Tag {day} ist der letzte Renntag"
+    nxt_date = date.fromisoformat(rc.config["days"][str(nxt)]["date"])
     t_start_next, _ = rc.day_window(nxt)
     release = t_start_next.replace(hour=6, minute=0, second=0, microsecond=0)
     if release >= t_start_next:
-        log.info("Tag %d startet um %s - kein Fenster vor dem Start",
-                 nxt, t_start_next.strftime("%H:%M"))
-        return None
-    return dayplan.morning_charge(
-        w["to_control"].weather, float(first["latitude"]),
-        float(first["longitude"]), release, t_start_next, car, batt, wh_end)
+        return None, (f"Tag {nxt} startet um "
+                      f"{t_start_next.strftime('%H:%M')}, kein Fenster davor")
+
+    here = overnight_point(routes)
+    weather, why = None, ""
+    if here is not None:
+        try:
+            weather = inputs.load_point_weather(here[0], here[1],
+                                                nxt_date).weather
+        except SystemExit:
+            why = (f"Nachtquartier {here[0]:.4f},{here[1]:.4f} fuer "
+                   f"{nxt_date} nicht im Cache "
+                   f"(python scripts/cache_weather.py {day})")
+        except Exception as e:
+            # Anything else - a stale environment.py without
+            # fetch_weather_at_point, a corrupt cache entry - must not take
+            # the plan down with it. The morning window is extra
+            # information; without it the day is still planned.
+            why = (f"Nachtquartier nicht auswertbar "
+                   f"({type(e).__name__}: {str(e)[:70]})")
+
+    if weather is None:
+        # older caches: take the next day's first route point instead
+        try:
+            _, nxt_routes = load_routes(nxt)
+            if "to_control" not in nxt_routes:
+                return None, (why or f"Tag {nxt}: Route noch nicht "
+                                     f"veroeffentlicht")
+            w = load_weathers(nxt, nxt_date, ("to_control",), spacing_km)
+            if "to_control" not in w:
+                return None, why or f"Tag {nxt}: kein Wetter im Cache"
+            weather = w["to_control"].weather
+            first = nxt_routes["to_control"].iloc[0]
+            here = (float(first["latitude"]), float(first["longitude"]))
+        except SystemExit as e:
+            return None, why or str(e).splitlines()[0]
+        except Exception as e:
+            return None, why or f"{type(e).__name__}: {str(e)[:70]}"
+
+    try:
+        return dayplan.morning_charge(weather, here[0], here[1], release,
+                                      t_start_next, car, batt, wh_end), why
+    except Exception as e:
+        return None, f"nicht berechenbar ({type(e).__name__}: {str(e)[:70]})"
 
 
 def load_weathers(day: int, day_date, which: tuple, spacing_km: float):
@@ -534,8 +575,8 @@ def main(argv=None) -> int:
         ceiling = None
         first_ok = next((o for _, o in rows if o.feasible), None)
         if first_ok is not None:
-            mc = load_morning(day, rc, args.spacing_km, car, batt,
-                              first_ok.end_wh)
+            mc, _ = load_morning(day, rc, routes, args.spacing_km, car,
+                                 batt, first_ok.end_wh)
             if mc is not None:
                 ceiling = mc.wh_max_arrival
         print(report.sweep_text(rows, batt, args.sweep_stop, ceiling))
@@ -567,22 +608,32 @@ def main(argv=None) -> int:
         ok = [o for o in opts if o.feasible]
         plotted = ok[-1] if ok else None      # die beste machbare Option
 
+    # The morning window is text, and useful whether or not anything is
+    # plotted - it used to be computed inside the plotting branch, so a
+    # plain run silently lost it.
+    mc = None
+    if plotted is not None and plotted.feasible:
+        mc, why = load_morning(day, rc, routes, args.spacing_km, car, batt,
+                               plotted.end_wh)
+        if mc is None:
+            print(f"\nKein Morgenfenster fuer Tag {day+1}: {why}")
+        else:
+            if why:
+                print(f"\nHinweis  {why}")
+            print(f"\nMorgenfenster Tag {day+1}: angeboten "
+                  f"{mc.offered:.0f} Wh, aufgenommen {mc.absorbed:.0f} Wh"
+                  + (f", verworfen {mc.spilled:.0f} Wh"
+                     if mc.spilled > 1 else "")
+                  + f"\n                     Ankunft ohne Verlust bis "
+                    f"{mc.wh_max_arrival:.0f} Wh "
+                    f"({100*mc.wh_max_arrival/capacity_wh(batt):.0f} %) "
+                    f"- tiefer ist nicht schlechter, nur mehr gefahren")
+
     if (args.plot or args.plot_png):
         if plotted is None or not plotted.feasible:
             print("\nKein Plot: die gewaehlte Option ist nicht machbar.")
         else:
             from data_analysis.strategy import plots
-            mc = load_morning(day, rc, args.spacing_km, car, batt,
-                              plotted.end_wh)
-            if mc is not None:
-                print(f"\nMorgenfenster Tag {day+1}: angeboten "
-                      f"{mc.offered:.0f} Wh, aufgenommen {mc.absorbed:.0f} Wh"
-                      + (f", verworfen {mc.spilled:.0f} Wh"
-                         if mc.spilled > 1 else "")
-                      + f"\n                     Ankunft ohne Verlust bis "
-                        f"{mc.wh_max_arrival:.0f} Wh "
-                        f"({100*mc.wh_max_arrival/capacity_wh(batt):.0f} %) "
-                        f"- tiefer ist nicht schlechter, nur mehr gefahren")
             files = plots.render(plotted, state, batt,
                                  png_prefix=args.plot_png, show=args.plot,
                                  morning=mc)
