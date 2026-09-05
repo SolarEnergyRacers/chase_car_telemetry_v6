@@ -395,6 +395,7 @@ class DayOption:
     below_floor_km: float = 0.0          # km below the 50 km/h regulation floor
     capped_km: float = 0.0               # km where the routing cap binds
     capped_cost: timedelta = None        # time those segments cost
+    cloud_margin: float = None           # 1 - needed sun / forecast sun
     wh_spilled: float = 0.0              # solar thrown away at a full pack
     t_full: object = None                # when the pack first hits the cap
     caps_kmh: np.ndarray = None          # routing cap per segment
@@ -639,7 +640,7 @@ def _evaluate_once(state, parts: dict, n_loops: int, car: Car_coeffs,
     opt.below_floor_km = float(np.sum(dists[below])) / 1e3
 
     # --- energy, leg by leg, with the stops spliced in where they happen
-    frames, t = [], state.t_now
+    frames, need, t = [], [], state.t_now
     i0 = 0
     km_run = 0.0        # running distance; the km_total column only exists
                         # after the concat, so a stop cannot read it yet
@@ -665,6 +666,19 @@ def _evaluate_once(state, parts: dict, n_loops: int, car: Car_coeffs,
                 n_traffic_signal=(
                     leg.route["n_traffic_signal"].to_numpy()[:-1]
                     if "n_traffic_signal" in leg.route.columns else 0))
+            # Second pass at the floor speed, for the "can I still reach the
+            # finish" curve. Same start time as the plan, which understates
+            # how late a slow run would actually be - and therefore
+            # understates the sun it would collect. Conservative on purpose:
+            # this curve is the trailering guard, not a forecast.
+            slow = total_Ws_for_lap(
+                leg.route, leg.weather, car, start_time=t,
+                speeds=np.minimum(leg_speeds, V_FLOOR_KMH / 3.6),
+                return_detail=True)
+            need.append((slow["p_motor"].to_numpy()
+                         + slow["p_aux"].to_numpy())
+                        * slow["dt_s"].to_numpy())
+
             frames.append(detail)
             t = t + timedelta(seconds=float(detail["dt_s"].sum()))
             km_run += leg.km
@@ -725,6 +739,7 @@ def _evaluate_once(state, parts: dict, n_loops: int, car: Car_coeffs,
                     "n_traffic_signal": [0],
                     "km_total": [km_now],
                 }))
+                need.append(np.array([car.aux_power * secs]))
                 t = t + dur
 
     detail = pd.concat(frames, ignore_index=True)
@@ -739,6 +754,8 @@ def _evaluate_once(state, parts: dict, n_loops: int, car: Car_coeffs,
 
     trace = soc_trace(batt, detail, wh_start=state.pack.wh)
     trace, spilled, t_full = _clip_to_capacity(trace, batt)
+    trace, opt.cloud_margin = _add_floor_curve(
+        trace, np.concatenate(need), batt, state.pack.wh)
 
     opt.trace = trace
     opt.wh_spilled = spilled
@@ -825,6 +842,51 @@ def morning_charge(weather: RouteWeather, lat: float, lon: float,
         trace=df, t_release=t_release, t_start=t_start, wh_start=wh_start,
         wh_end=wh, offered=offered, absorbed=wh - wh_start, spilled=spilled,
         wh_max_arrival=cap - offered, lat=lat, lon=lon)
+
+
+def _add_floor_curve(trace: pd.DataFrame, need_ws: np.ndarray,
+                     batt: Battery_coeffs, wh_start: float):
+    """Energy below which the finish can no longer be reached, per position.
+
+        wh_floor(i) = Boden + Verbrauch(i..Ziel bei v_min) - Sonne(i..Ziel)
+
+    Both sums run BACKWARDS from the finish, so the curve falls to the
+    usable floor at the end. The distance between it and the planned pack
+    curve is the room left for loops and for speed; a touch means the rest
+    of the day is compulsory at minimum speed, a crossing means not
+    arriving.
+
+    Deliberately blind to the deadline. It answers "do I get there", not
+    "do I get there in time" - and of the two, being trailered is the more
+    expensive.
+
+    Also returns the cloud margin at the current position: the share of the
+    forecast sun that may fail to arrive and still leave the finish
+    reachable. Large is good, which is why it is phrased as a margin and
+    not as a required coverage.
+    """
+    floor = (1.0 - batt.usable) * capacity_wh(batt)
+    dt = trace["dt_s"].to_numpy()
+    sun_wh = trace["p_solar"].to_numpy() * dt / 3600.0
+    need_wh = need_ws / 3600.0
+
+    # reverse cumulative sums: everything from here to the finish
+    need_to_end = np.cumsum(need_wh[::-1])[::-1]
+    sun_to_end = np.cumsum(sun_wh[::-1])[::-1]
+
+    trace = trace.copy()
+    trace["wh_floor"] = np.maximum(floor + need_to_end - sun_to_end, floor)
+
+    have = wh_start - floor
+    required = max(float(need_to_end[0]) - have, 0.0)
+    total_sun = float(sun_to_end[0])
+    if required <= 0:
+        margin = 1.0
+    elif total_sun <= 0:
+        margin = 0.0
+    else:
+        margin = max(0.0, 1.0 - required / total_sun)
+    return trace, margin
 
 
 def _clip_to_capacity(trace: pd.DataFrame, batt: Battery_coeffs):

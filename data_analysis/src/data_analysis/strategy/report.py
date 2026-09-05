@@ -96,20 +96,21 @@ def options_table(opts: list, batt=None) -> str:
     """The decision: one row per remaining loop count."""
     L = ["", f"{'Loops':>5} {'km':>7} {'Ø km/h':>7} {'min SOC':>8} "
              f"{'End-SOC':>8} {'Wh ü.Boden':>11} {'Zeitreserve':>12} "
-             f"{'Wechsel':>8}"]
+             f"{'Wechsel':>8} {'Wolkenmarge':>12}"]
     last_ok = None
     for o in opts:
         if not o.feasible:
             L.append(f"{o.n_loops:>5} {o.km:>7.1f} "
                      f"{'—':>7} {'—':>8} {'—':>8} {'—':>11} {'—':>12} "
-                     f"{'—':>8}")
+                     f"{'—':>8} {'—':>12}")
             L.append(f"        nicht machbar: {o.reason}")
             break
         last_ok = o
         L.append(f"{o.n_loops:>5} {o.km:>7.1f} {o.avg_kmh:>7.1f} "
                  f"{o.min_soc*100:>7.0f} % {o.end_soc*100:>7.0f} % "
                  f"{o.wh_above_floor:>+11.0f} {_hm(o.reserve):>12} "
-                 f"{len(o.driver_changes):>8}"
+                 f"{len(o.driver_changes):>8} "
+                 f"{'—' if o.cloud_margin is None else f'{100*o.cloud_margin:.0f} %':>12}"
                  + (f"   {o.wh_spilled:>5.0f} Wh verworfen"
                     if o.wh_spilled > 5 else ""))
 
@@ -274,6 +275,10 @@ def plan_text(opt, state) -> str:
              + timedelta(seconds=float(opt.trace["dt_s"].iloc[-1])))
     L.append(f"Zeit      Ziellinie {_clock(t_end)}, "
              f"Reserve bei Vollgas {_hm(opt.reserve)}")
+    if opt.cloud_margin is not None:
+        L.append(f"Wolken    Marge {100*opt.cloud_margin:.0f} % - so viel "
+                 f"Ausfall gegenueber der Prognose ist verkraftbar, "
+                 f"ohne das Ziel zu verfehlen")
     n_dc = len(opt.driver_changes)
     L.append(f"Stehen    {_hm(opt.stop_time)} gesamt, davon "
              f"{n_dc} Fahrerwechsel"

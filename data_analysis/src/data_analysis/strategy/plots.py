@@ -164,6 +164,15 @@ def soc_plot(opt, state, batt, plt):
             va="bottom", fontsize=8, color="tab:red")
     ax.text(km[0], cap, f"  Packdeckel {cap:.0f} Wh", va="top",
             fontsize=8, color="tab:blue")
+    # Energy below which the finish is no longer reachable at minimum
+    # speed. The gap to the black curve is the room left for loops and for
+    # speed; a touch means the rest of the day is compulsory at v_min, a
+    # crossing means not arriving.
+    if "wh_floor" in tr.columns:
+        _tag(ax.plot(km, tr["wh_floor"], color="tab:red", lw=1.2, ls="--",
+                     label="Mindestenergie bis zum Ziel"))
+        ax.fill_between(km, 0, tr["wh_floor"], color="tab:red", alpha=0.07,
+                        lw=0)
     _tag(ax.plot(km, tr["wh_remaining"], color="k", lw=2,
                  label="Pack, geplant"))
 
