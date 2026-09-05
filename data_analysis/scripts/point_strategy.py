@@ -51,6 +51,21 @@ def route_stems(day: int) -> dict:
 
 # ------------------------------------------------------------------- input ----
 
+# Warnings that are true but say nothing actionable on every single run.
+# The climb/descent one names a known, quantified gap (15-45 Wh per stage,
+# measured against the Valhalla edge elevations); repeating it before every
+# plan only trains people to skip the header.
+_MUTED = ("route has no climb/descent columns",)
+
+
+class _MuteFilter(lg.Filter):
+    """Drop known, already-decided warnings."""
+
+    def filter(self, record):
+        msg = record.getMessage()
+        return not any(m in msg for m in _MUTED)
+
+
 class _OnceFilter(lg.Filter):
     """Let each distinct log message through once.
 
@@ -259,6 +274,29 @@ def load_routes(day: int):
         except (KeyError, FileNotFoundError) as e:
             log.info("Tag %d ohne '%s': %s", day, which, e)
 
+    # road_class and the roundabout positions come from the cached Valhalla
+    # answers, not from a compiled column - see attach_roadinfo(). The parts
+    # have to be listed in the order raceconfig stitches them, otherwise the
+    # mapping is shifted.
+    route_dir = inputs.find_route_dir()
+
+    def geos_for(which):
+        spec = rc.config["days"][str(day)]["stages"].get(which)
+        if not spec:
+            return []
+        out = []
+        for n in spec["routes"]:
+            g = route_dir / n.replace(".geojson.pkl", ".geojson")
+            if not g.is_file():
+                return []
+            out.append(g)
+        return out
+
+    for which in list(routes):
+        g = geos_for(which)
+        if g:
+            routes[which] = inputs.attach_roadinfo(routes[which], g)
+
     if rc.loops_pending(day):
         log.warning("Tag %d: Loop noch nicht veroeffentlicht - 0 Loops ist "
                     "hier keine Aussage ueber den Tag", day)
@@ -270,7 +308,11 @@ def load_routes(day: int):
             day_loops = {}
         if day_loops:
             name = next(iter(day_loops))
-            routes["loop"] = day_loops[name]
+            loop_fp = route_dir / f"{route_stems(day)['loop']}.geojson"
+            routes["loop"] = (
+                inputs.attach_roadinfo(day_loops[name], loop_fp,
+                                       mirror_tail=True)
+                if loop_fp.is_file() else day_loops[name])
             if len(day_loops) > 1:
                 log.info("Tag %d hat %d Loop-Varianten, benutzt wird %r",
                          day, len(day_loops), name)
@@ -442,7 +484,11 @@ def parse_args(argv=None):
                         "durchrechnen und die Ausbeute vergleichen. "
                         "Negative km zaehlen vom Ziel zurueck, dann mit "
                         "Gleichheitszeichen: --sweep-stop=-1")
-    g.add_argument("--n-max", type=int, default=10, dest="n_max")
+    g.add_argument("--n-max", type=int, default=10, dest="n_max",
+                   help="wie viele Loop-Zahlen die Optionstabelle "
+                        "durchrechnet. Sie bricht ohnehin eine Zeile nach "
+                        "der ersten nicht machbaren ab, der Wert greift also "
+                        "nur, wenn alle machbar sind")
     g.add_argument("--plot", action="store_true",
                    help="beide Anzeigen in einem Fenster oeffnen (zoomen, "
                         "verschieben, speichern). Ohne --plan wird die beste "
@@ -464,6 +510,7 @@ def main(argv=None) -> int:
                    format="%(levelname)-7s %(message)s")
     for h in lg.getLogger().handlers:
         h.addFilter(_OnceFilter())
+        h.addFilter(_MuteFilter())
 
     car, batt = Car_coeffs(), Battery_coeffs()
     rc = inputs.load_raceconfig()
@@ -492,15 +539,6 @@ def main(argv=None) -> int:
             f"Tag {day}: fuer '{part}' fehlt Route oder Wetter - "
             f"vorhanden: {sorted(parts)}")
 
-    stale = [w for w, (r, _) in parts.items()
-             if not {"climb", "descent"} <= set(r.columns)]
-    if stale:
-        notes.append(
-            f"Routen ohne climb/descent-Spalten: {', '.join(sorted(stale))}. "
-            f"Der Vertikalterm faellt auf den Netto-Gradienten zurueck. "
-            f"Gegen die Edge-Hoehen aus dem Valhalla-Cache gemessen fehlen "
-            f"15-45 Wh je Streckenteil, und das ist eine Untergrenze - "
-            f"mit compile_route() auf dem SRTM-Raster neu kompilieren.")
     pack = resolve_pack(args, batt)
     t_now = resolve_start_time(args, day_date)
 
@@ -603,8 +641,6 @@ def main(argv=None) -> int:
                   "0 heisst: diesen beenden und zum Ziel.")
         print(report.options_table(opts))
         print(report.trigger_text(opts, state))
-        print("\nFahrplan fuer eine Option:  --plan N   "
-              "(optional mit --stop KM:MIN)")
         ok = [o for o in opts if o.feasible]
         plotted = ok[-1] if ok else None      # die beste machbare Option
 

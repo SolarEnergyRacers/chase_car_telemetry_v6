@@ -78,6 +78,23 @@ V_FLOOR_TOL_KMH    = 1.0
 
 # ------------------------------------------------------------ route slice ----
 
+def _assumed_limit(route: pd.DataFrame) -> np.ndarray:
+    """Legal limit assumed from road_class, per segment.
+
+    Only where OSM has no maxspeed - 64 % of the race distance, and the
+    long Karoo stages have none at all. An ASSUMPTION: shown in the plots
+    so the gap to v_route is visible, never used for the penalty warning,
+    because a guess must not become a legal basis.
+    """
+    n = len(route) - 1
+    if "road_class" not in route.columns:
+        return np.full(n, np.nan)
+    from ..roadinfo.roadinfo_api import ASSUMED_LIMIT_KMH
+    rc = route["road_class"].to_numpy()[:n]
+    return np.array([ASSUMED_LIMIT_KMH.get(c, np.nan) for c in rc],
+                    dtype=float)
+
+
 def route_from(route: pd.DataFrame, distance_m: float) -> pd.DataFrame:
     """The remainder of a route from `distance_m` onwards, re-indexed to 0.
 
@@ -392,7 +409,7 @@ class DayOption:
         if self.wh_spilled <= 5:
             return ""
         return (f"{self.wh_spilled:.0f} Wh verworfen "
-                f"(≈ {self.wh_spilled/14:.0f} km) - Plan zu langsam")
+                f"(≈ {self.wh_spilled/14:.0f} km)")
 
 
 def evaluate(state, parts: dict, n_loops: int, car: Car_coeffs,
@@ -641,7 +658,13 @@ def _evaluate_once(state, parts: dict, n_loops: int, car: Car_coeffs,
                 leg=leg.name, kind="drive", panel="flat",
                 v_route=leg.route["speed_route"].to_numpy()[:-1],
                 v_limit=(leg.route["speed_limit"].to_numpy()[:-1]
-                         if "speed_limit" in leg.route.columns else np.nan))
+                         if "speed_limit" in leg.route.columns else np.nan),
+                v_limit_est=_assumed_limit(leg.route),
+                n_roundabout=(leg.route["n_roundabout"].to_numpy()[:-1]
+                              if "n_roundabout" in leg.route.columns else 0),
+                n_traffic_signal=(
+                    leg.route["n_traffic_signal"].to_numpy()[:-1]
+                    if "n_traffic_signal" in leg.route.columns else 0))
             frames.append(detail)
             t = t + timedelta(seconds=float(detail["dt_s"].sum()))
             km_run += leg.km
@@ -697,6 +720,9 @@ def _evaluate_once(state, parts: dict, n_loops: int, car: Car_coeffs,
                     "panel": [panel],
                     "v_route": [np.nan],
                     "v_limit": [np.nan],
+                    "v_limit_est": [np.nan],
+                    "n_roundabout": [0],
+                    "n_traffic_signal": [0],
                     "km_total": [km_now],
                 }))
                 t = t + dur

@@ -4,6 +4,7 @@ import json
 import logging as lg
 import hashlib
 from   pathlib import Path
+import numpy as np
 import requests
 import time
 
@@ -86,6 +87,97 @@ def get_info(file: Path) -> dict:
     return info
 
 
+# Legal limits assumed per road class where OSM has none. Only 36 % of the
+# race distance carries a maxspeed tag, and the long Karoo stages carry
+# none at all, so a class default is the only way to show a limit there.
+#
+# trunk and motorway come from the data: 95 % and 87 % of the tagged
+# kilometres in these classes say 120. primary and secondary do NOT - the
+# most common values there cover only 36 % and 43 %, and secondary comes
+# out ABOVE primary, which is implausible. Those two therefore use the
+# South African rule (100 outside built-up areas, 60 inside) rather than a
+# weak majority in a thin sample.
+#
+# ASSUMPTIONS, not law. Anything derived from these must be marked as
+# estimated, and they must never drive a penalty decision.
+ASSUMED_LIMIT_KMH = {
+    "motorway":      120.0,
+    "trunk":         120.0,
+    "primary":       100.0,
+    "secondary":     100.0,
+    "tertiary":       60.0,
+    "residential":    60.0,
+    "unclassified":   60.0,
+    "service_other":  30.0,
+}
+
+
+def get_edge_info(info: dict) -> list[dict]:
+    """Per-point attributes of the edge each point was matched onto.
+
+    One dict per point of the LineString, in order, so the result lines up
+    with the compiled route node for node - matched_points and the route
+    have the same length by construction.
+
+    Superset of get_speed(); that one stays as a thin wrapper so existing
+    callers are unaffected.
+    """
+    out = []
+    for e in info["matched_points"]:
+        if e["type"] == "unmatched":
+            out.append({"speed": None, "speed_limit": None,
+                        "road_class": None, "edge_index": None})
+            continue
+        idx = e.get("edge_index")
+        idx = idx - 2*(idx & int(2**63))  # 64b signed
+        edge = info["edges"][idx]
+        out.append({
+            "speed":       edge.get("speed"),
+            "speed_limit": edge.get("speed_limit"),
+            "road_class":  edge.get("road_class"),
+            "edge_index":  idx,
+        })
+    return out
+
+
+def road_features(info: dict, flags=("roundabout", "traffic_signal")) -> dict:
+    """Point indices of roundabouts and traffic signals.
+
+    Returns {flag: [point_index, ...]}, one entry per FEATURE - not per
+    edge. A roundabout is three to four consecutive edges of about 10 m
+    each (measured: 3.1 edges, 34 m per feature over 36 roundabouts), so
+    counting edges would triple every penalty derived from it. Consecutive
+    flagged edge indices therefore collapse into one feature.
+
+    The point index is the middle of the points matched onto that feature,
+    and it maps straight onto the compiled route: node i of the route is
+    point i here. Verified against the seven roundabouts of day1_loop,
+    which come out at km 5.27 / 6.07 / 7.07 / 7.87 / 8.69 / 9.51 / 10.39 -
+    the same places the 28 km/h dips in speed_route sit, to within 30 m.
+
+    Reading them here rather than from a compiled column means no
+    recompilation, and therefore no fresh Valhalla request. That matters:
+    a refetch has been observed to return four unmatched points and 51 km
+    without a routing speed where the cached answer was complete.
+    """
+    edges = info["edges"]
+    per_point = get_edge_info(info)
+    out = {}
+    for flag in flags:
+        idx = [i for i, e in enumerate(edges) if e.get(flag)]
+        found = []
+        if idx:
+            groups = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+            for g in groups:
+                g = set(int(x) for x in g)
+                pts = [k for k, p in enumerate(per_point)
+                       if p["edge_index"] in g]
+                if pts:
+                    found.append(int(np.mean(pts)))
+        out[flag] = found
+    return out
+
+
 def get_speed(info: dict) -> list[tuple]:
     """get speed from valhalla info dict
     Args:
@@ -98,17 +190,7 @@ def get_speed(info: dict) -> list[tuple]:
             between them - neither point's value is exact for that segment.
             Difference is negligible in practice (<0.5% of travel time).
     """
-    speeds = []
-    for e in info["matched_points"]:
-        mt = e["type"]
-        if mt == "unmatched":
-            speeds.append((None, None))
-            continue
-        idx = e.get("edge_index")
-        idx = idx - 2*(idx & int(2**63))  # 64b signed
-        edge = info["edges"][idx]
-        speeds.append((edge.get("speed"), edge.get("speed_limit")))
-    return speeds
+    return [(d["speed"], d["speed_limit"]) for d in get_edge_info(info)]
 
 
 def scan_cache(fps: list[Path]) -> dict:

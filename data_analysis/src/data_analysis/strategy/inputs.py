@@ -315,6 +315,71 @@ def _fetched_at_from_cache(key: str, archive: bool):
         return None, fn.name
 
 
+def attach_roadinfo(route, geos, mirror_tail: bool = False):
+    """Add road_class and roundabout / traffic-signal counts to a route.
+
+    Read from the cached Valhalla answers rather than from a compiled
+    column, so nothing has to be recompiled. Recompiling means a fresh
+    Valhalla request, and one of those has already come back with four
+    unmatched points and 51 km without a routing speed where the cached
+    answer was complete. Not worth risking for a column.
+
+    Works because matched_points and the compiled route have the same
+    length by construction - node i of a compiled part is point i of its
+    answer. The assembly has to be mirrored though:
+
+        geos:        the parts in the order raceconfig stitches them
+        mirror_tail: for a loop, which is the outbound leg followed by
+                     itself reversed with the turnaround node dropped
+
+    The result is checked against the node count and skipped with a warning
+    if it does not fit, rather than silently attaching a shifted mapping -
+    a roundabout in the wrong place is worse than no roundabout.
+    """
+    from ..roadinfo import roadinfo_api
+
+    route = route.copy()
+    geos = [geos] if not isinstance(geos, (list, tuple)) else list(geos)
+
+    classes, counts = [], {"roundabout": [], "traffic_signal": []}
+    for g in geos:
+        try:
+            info = roadinfo_api.get_info(g)
+        except Exception as e:
+            log.warning("kein roadinfo fuer %s (%s) - road_class fehlt",
+                        getattr(g, "name", g), type(e).__name__)
+            return route
+        pts = roadinfo_api.get_edge_info(info)
+        classes += [d["road_class"] for d in pts]
+        feats = roadinfo_api.road_features(info)
+        for flag in counts:
+            col = np.zeros(len(pts), dtype=int)
+            for i in feats.get(flag, []):
+                col[i] += 1
+            counts[flag].append(col)
+
+    for flag in counts:
+        counts[flag] = np.concatenate(counts[flag])
+
+    if mirror_tail:
+        # the return leg is the outbound leg reversed, with the turnaround
+        # node dropped so it is not counted twice
+        classes = classes + classes[-2::-1]
+        for flag in counts:
+            counts[flag] = np.concatenate([counts[flag],
+                                           counts[flag][-2::-1]])
+
+    if len(classes) != len(route):
+        log.warning("roadinfo hat %d Punkte, Route %d Knoten - nicht "
+                    "zugeordnet", len(classes), len(route))
+        return route
+
+    route["road_class"] = classes
+    route["n_roundabout"] = counts["roundabout"]
+    route["n_traffic_signal"] = counts["traffic_signal"]
+    return route
+
+
 def load_point_weather(lat: float, lon: float, day: date,
                        variables: list = None) -> CachedWeather:
     """One place, one day, FROM CACHE ONLY. See load_weather().

@@ -80,9 +80,6 @@ def header(state, weathers: dict, solar_check: dict = None) -> str:
                  + (f" ({cw.fetched_at.astimezone(RACE_TZ):%d.%m %H:%M} SAST)"
                     if cw.fetched_at else "")
                  + f", {len(cw.weather.distance_km)} Punkte")
-    L.append("          Modelllauf-Alter liefert die API nicht - der Lauf "
-             "kann einige Stunden aelter sein")
-
     if solar_check:
         L.append(f"Solar     gemessen {solar_check['measured_w']:.0f} W · "
                  f"Prognose {solar_check['forecast_w']:.0f} W · "
@@ -130,8 +127,6 @@ def options_table(opts: list, batt=None) -> str:
     else:
         L.append("Kein Loop in der geprueften Spanne scheitert - n_max "
                  "erhoehen")
-    L.append("Die Loop-Zahl wird nicht committet: nach jedem Loop neu "
-             "entscheiden.")
     return "\n".join(L)
 
 

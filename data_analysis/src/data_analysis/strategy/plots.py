@@ -330,13 +330,6 @@ def st_plot(opt, state, plt):
     _power_over_time(axp, tr)
     _cumulatives_over_time(axc, tr)
 
-    if opt.below_floor_km > 0:
-        ax.text(0.99, 0.02,
-                f"{opt.below_floor_km:.1f} km unter {V_FLOOR_KMH:.0f} km/h "
-                f"auf Strassen mit Routing ≥ {V_FLOOR_APPLIES_AT:.0f}",
-                transform=ax.transAxes, ha="right", fontsize=8,
-                color="tab:red")
-
     for a in (ax, axp, axc):
         a._x_kind = "h"
     _autoscale_y_on_zoom(fig)
@@ -539,14 +532,13 @@ def speed_plot(opt, state, plt):
 
     fig, ax = plt.subplots(figsize=(12, 5.5), layout="constrained")
 
-    ax.axhline(V_FLOOR_KMH, color="tab:red", lw=1, ls="--")
-    ax.text(km[0], V_FLOOR_KMH, f" Penalty-Grenze {V_FLOOR_KMH:.0f} km/h "
-            f"(wo Limit ≥ {V_FLOOR_APPLIES_AT:.0f})", color="tab:red",
-            fontsize=7.5, va="bottom")
-
     v_route = d["v_route"].to_numpy()
     v_limit = d["v_limit"].to_numpy()
     v_soll = d["speed_kmh"].to_numpy()
+    v_est = (d["v_limit_est"].to_numpy() if "v_limit_est" in d.columns
+             else np.full(len(v_route), np.nan))
+    # only where OSM has nothing - the tagged value always wins
+    v_est = np.where(np.isfinite(v_limit), np.nan, v_est)
 
     _tag(ax.step(km, v_route, where="post", color="tab:blue", lw=1.0,
                  alpha=0.65, label="v_route (Valhalla-Schaetzung)"))
@@ -560,6 +552,18 @@ def speed_plot(opt, state, plt):
         ax.text(0.5, 0.95, "keine v_limit-Daten in dieser Route",
                 transform=ax.transAxes, ha="center", va="top", fontsize=8,
                 color="tab:green")
+
+    # Assumed limit where OSM has none. Deliberately a different, lighter
+    # style: it is a class default, not a tagged value, and the penalty
+    # warning does not use it. Only 36 % of the race distance carries a
+    # maxspeed, and the long Karoo stages carry none at all - without this
+    # line the plot simply shows nothing there.
+    if np.isfinite(v_est).any():
+        n_est = int(np.isfinite(v_est).sum())
+        _tag(ax.step(km, v_est, where="post", color="tab:green", lw=1.0,
+                     ls=":", alpha=0.75,
+                     label=f"v_limit geschaetzt aus road_class "
+                           f"({100*n_est/len(v_est):.0f} % der Segmente)"))
 
     _tag(ax.step(km, v_soll, where="post", color="k", lw=1.6,
                  label=f"Soll (Ø {opt.avg_kmh:.1f} km/h)"))
@@ -577,13 +581,6 @@ def speed_plot(opt, state, plt):
                               f"({opt.capped_km:.0f} km"
                               + (f", {_fmt(opt.capped_cost)}"
                                  if opt.capped_cost else "") + ")")
-    below = (v_soll < V_FLOOR_KMH - 1.0) & (v_route >= V_FLOOR_APPLIES_AT)
-    if below.any():
-        ax.fill_between(km, 0, v_soll, where=below, color="tab:red",
-                        alpha=0.2, lw=0, step="post",
-                        label=f"unter der Penalty-Grenze "
-                              f"({opt.below_floor_km:.1f} km)")
-
     for _, r in tr[tr["kind"] == "stop"].iterrows():
         ax.axvline(r["km_total"], color="grey", lw=3, alpha=0.3)
 
