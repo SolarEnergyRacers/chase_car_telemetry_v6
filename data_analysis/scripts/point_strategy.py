@@ -496,6 +496,13 @@ def parse_args(argv=None):
     g.add_argument("--plot-png", nargs="?", const="strategie",
                    metavar="PREFIX", dest="plot_png",
                    help="Anzeigen zusaetzlich als PNG schreiben")
+    g.add_argument("--no-save", action="store_true", dest="no_save",
+                   help="keine Plandateien schreiben. Sonst landet jede "
+                        "machbare Option als Datei in plans/, wo "
+                        "live_strategy.py sie zur Auswahl anbietet")
+    g.add_argument("--plans-dir", dest="plans_dir", metavar="DIR",
+                   help="Zielordner der Plandateien (Default: "
+                        "data_analysis/plans, oder $SSC_PLANS_DIR)")
     g.add_argument("--spacing-km", type=float, default=5.0,
                    dest="spacing_km",
                    help="muss dem Wert in cache_weather.py entsprechen, "
@@ -593,6 +600,7 @@ def main(argv=None) -> int:
     print(report.header(state, weathers))
 
     plotted = None
+    to_save = []        # (DayOption, mode) pairs written as plan files
 
     if args.sweep_stop is not None:
         # which loop count to sweep at: the one asked for, otherwise the
@@ -629,10 +637,12 @@ def main(argv=None) -> int:
         opt = dayplan.evaluate(state, parts, 0, car, batt, **ev)
         print(report.plan_text(opt, state))
         plotted = opt
+        to_save = [(opt, "plan")]
     elif args.plan is not None:
         opt = dayplan.evaluate(state, parts, args.plan, car, batt, **ev)
         print(report.plan_text(opt, state))
         plotted = opt
+        to_save = [(opt, "plan")]
     else:
         opts = dayplan.options(state, parts, car, batt, n_max=args.n_max,
                                **ev)
@@ -643,6 +653,34 @@ def main(argv=None) -> int:
         print(report.trigger_text(opts, state))
         ok = [o for o in opts if o.feasible]
         plotted = ok[-1] if ok else None      # die beste machbare Option
+        # every feasible row is a candidate the live view may be asked to
+        # follow - which one is only known after reading the table
+        to_save = [(o, "table") for o in ok]
+
+    if to_save and not args.no_save:
+        from data_analysis.strategy import planfile
+        # the REGULATED halt lengths, which are not the planned ones
+        # (dayplan budgets 35/8 min, the rules ask 30/5). The live view
+        # shows from when driving on is allowed and cannot read
+        # race_config.json itself, so the numbers travel in the plan file.
+        regulated = {"control": float(rc.config.get("control_stop_minutes",
+                                                    30)),
+                     "loop": float(rc.config.get("loop_stop_minutes", 5))}
+        written = []
+        for o, mode in to_save:
+            if o.feasible and o.trace is not None:
+                try:
+                    written.append(planfile.save_plan(
+                        o, state, batt, weathers, out_dir=args.plans_dir,
+                        mode=mode, regulated=regulated))
+                except Exception as e:      # a plan file is a convenience,
+                    log.warning("Plandatei fuer %d Loops nicht geschrieben: "
+                                "%s", o.n_loops, e)   # never the result
+        if written:
+            print(f"\nPlandateien ({written[0].parent}):")
+            for fp in written:
+                print(f"  {fp.name}")
+            print("  -> in live_strategy.py unter 'Plan' auswaehlbar")
 
     # The morning window is text, and useful whether or not anything is
     # plotted - it used to be computed inside the plotting branch, so a

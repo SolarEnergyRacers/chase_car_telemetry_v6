@@ -1,0 +1,672 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SER Live-Strategie</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #101418; --panel: #1a2027; --panel2: #222a33; --line: #2f3a45;
+    --fg: #e8edf2; --muted: #8fa0b0; --accent: #4cc3ff; --good: #4ade80;
+    --bad: #f87171; --warn: #fbbf24; --soll: #ffffff; --route: #4cc3ff;
+    --limit: #4ade80; --plan: #9aa7ff; --live: #fbbf24; --floor: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center;
+           padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+           position: sticky; top: 0; z-index: 5; }
+  header .title { font-weight: 700; font-size: 16px; }
+  header .clock { font-size: 22px; font-variant-numeric: tabular-nums; font-weight: 600; }
+  header .plan { flex: 1 1 320px; color: var(--muted); font-size: 13px;
+                 overflow: hidden; }
+  select { max-width: 420px; background: var(--panel2); color: var(--fg);
+           border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  button { background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+           border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 13px; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: #1e4d66; border-color: #2f7ea3; }
+  input[type=number] { width: 90px; background: var(--panel2); color: var(--fg);
+                       border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+         background: var(--muted); margin-right: 4px; vertical-align: middle; }
+  .dot.ok { background: var(--good); } .dot.warn { background: var(--warn); }
+  .dot.bad { background: var(--bad); }
+  main { display: grid; gap: 10px; padding: 10px 14px 20px;
+         grid-template-columns: repeat(12, 1fr); }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 10px 12px; min-height: 96px; }
+  .tile h3 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase;
+             letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+  .big { font-size: 44px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .mid { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .unit { font-size: 14px; color: var(--muted); font-weight: 500; margin-left: 4px; }
+  .row { display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+  .good { color: var(--good); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 13px;
+        font-variant-numeric: tabular-nums; }
+  .kv div:nth-child(odd) { color: var(--muted); }
+  .c12 { grid-column: span 12; } .c8 { grid-column: span 8; } .c6 { grid-column: span 6; }
+  .c4 { grid-column: span 4; } .c3 { grid-column: span 3; }
+  @media (max-width: 1100px) { .c3 { grid-column: span 6; } .c4 { grid-column: span 6; }
+                               .c8 { grid-column: span 12; } }
+  @media (max-width: 640px)  { .c3, .c4, .c6 { grid-column: span 12; } .big { font-size: 36px; } }
+  canvas { width: 100%; height: 260px; display: block; }
+  canvas.tall { height: 300px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px;
+          font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.num, th.num { text-align: right; }
+  .bar { height: 10px; background: var(--panel2); border-radius: 5px; overflow: hidden; margin: 6px 0; }
+  .bar > div { height: 100%; background: var(--good); }
+  .zones { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .zone { background: var(--panel2); border-radius: 6px; padding: 4px 8px; font-size: 13px;
+          border-left: 3px solid var(--soll); }
+  .zone b { font-size: 16px; }
+  .log { font-size: 12px; color: var(--muted); max-height: 120px; overflow: auto;
+         font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; }
+  .msg { padding: 30px; text-align: center; color: var(--muted); font-size: 18px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted);
+            margin-top: 4px; }
+  .legend span::before { content: ""; display: inline-block; width: 14px; height: 3px;
+                         margin-right: 5px; vertical-align: middle; background: currentColor; }
+  .stale { opacity: .55; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">SER Live-Strategie</div>
+  <div class="clock" id="clock">--:--:--</div>
+  <div class="plan" id="planLabel">kein Plan geladen</div>
+  <div>
+    <span class="dot" id="dotTel"></span><span id="telText" class="sub">Telemetrie</span>
+    &nbsp;&nbsp;<span class="dot" id="dotGps"></span><span id="gpsText" class="sub">GPS</span>
+  </div>
+  <div>
+    <select id="planSelect"><option value="">Plan wählen …</option></select>
+    <button id="btnReload" title="Planliste neu lesen">↻</button>
+    <button class="primary" id="btnLoad">Plan übernehmen</button>
+  </div>
+</header>
+
+<main id="main">
+  <div class="tile c3">
+    <h3>Geschwindigkeit</h3>
+    <div class="row">
+      <div><span class="big" id="vNow">–</span><span class="unit">km/h</span></div>
+      <div><span class="mid" id="vSoll">–</span><span class="unit">Soll</span></div>
+      <div class="mid" id="vDelta"></div>
+    </div>
+    <div class="sub" id="vSub"></div>
+    <div class="zones" id="zones"></div>
+  </div>
+
+  <div class="tile c3">
+    <h3>Position</h3>
+    <div class="row">
+      <div><span class="big" id="posKm">–</span><span class="unit">km</span></div>
+      <div class="sub" id="posTotal"></div>
+    </div>
+    <div class="sub" id="posLeg"></div>
+    <div class="kv" style="margin-top:6px">
+      <div>Zeitplan</div><div id="posSched">–</div>
+      <div>Quelle</div><div id="posSrc">–</div>
+    </div>
+    <div id="haltBox" style="display:none; margin-top:8px; padding-top:8px; border-top:1px solid var(--line)">
+      <div class="row">
+        <div><span class="mid" id="haltFree">–</span><span class="unit">weiter ab</span></div>
+        <div class="sub" id="haltPlan"></div>
+      </div>
+      <div class="sub" id="haltArr"></div>
+      <div class="row" style="margin-top:6px; gap:6px">
+        <button class="primary" id="btnStop" title="Ankunft am Halt bestätigen">Stopp jetzt</button>
+        <input type="text" id="stopAt" placeholder="HH:MM" style="width:70px; background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 8px">
+        <button id="btnStopAt" title="Ankunft nachtragen">nachtragen</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="tile c3">
+    <h3>Nächste Ankunft</h3>
+    <div class="mid" id="nextName">–</div>
+    <div class="row" style="margin-top:4px">
+      <div><span class="big" id="nextLive">–</span></div>
+      <div class="sub">Plan <span id="nextPlan">–</span></div>
+    </div>
+    <div class="sub" id="nextSub"></div>
+  </div>
+
+  <div class="tile c3">
+    <h3>Fahrer</h3>
+    <div class="row">
+      <div><span class="big" id="drvTime">–</span><span class="unit">gefahren</span></div>
+      <div><span class="mid" id="drvLeft">–</span><span class="unit">bis 2 h</span></div>
+    </div>
+    <div class="bar"><div id="drvBar" style="width:0%"></div></div>
+    <div class="sub" id="drvLatest"></div>
+    <div class="row" style="margin-top:6px; gap:6px">
+      <button class="primary" id="btnDrv" title="Setzt die 2 Stunden zurück">Fahrerwechsel jetzt</button>
+      <input type="text" id="drvAt" placeholder="HH:MM" style="width:70px; background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 8px">
+      <button id="btnDrvAt" title="Wechsel nachtragen, der früher stattgefunden hat">nachtragen</button>
+    </div>
+    <div class="sub" id="drvNext"></div>
+    <div class="sub" id="drvLog"></div>
+  </div>
+
+  <div class="tile c12">
+    <h3>Sollgeschwindigkeit voraus &nbsp;<span id="stripRange" style="text-transform:none;letter-spacing:0"></span></h3>
+    <canvas id="strip"></canvas>
+    <div class="legend">
+      <span style="color:var(--soll)">Soll</span>
+      <span style="color:var(--route)">v_route (Routing-Deckel)</span>
+      <span style="color:var(--limit)">v_limit (gesetzlich / geschätzt gepunktet)</span>
+      <span style="color:#6b7f93">Höhe</span>
+      <span style="color:var(--warn)">Halt</span>
+      <span style="color:#ff8fd0">Kreisel / Ampel</span>
+    </div>
+  </div>
+
+  <div class="tile c8">
+    <h3>Energie im Pack über den Tag</h3>
+    <canvas id="energy" class="tall"></canvas>
+    <div class="legend">
+      <span style="color:var(--plan)">Plan</span>
+      <span style="color:var(--live)">Ist (V·I integriert)</span>
+      <span style="color:#ff8fd0">SOC aus Spannung (Band)</span>
+      <span style="color:var(--floor)">Boden: darunter Ziel nicht erreichbar</span>
+    </div>
+  </div>
+
+  <div class="tile c4">
+    <h3>Energie am aktuellen Punkt</h3>
+    <div class="row">
+      <div><span class="big" id="eLive">–</span><span class="unit">Wh Ist</span></div>
+      <div><span class="mid" id="ePlan">–</span><span class="unit">Wh Plan</span></div>
+    </div>
+    <div class="row"><div class="mid" id="eDelta"></div><div class="sub" id="eSplit"></div></div>
+    <div class="kv" style="margin-top:8px">
+      <div>SOC Ist / Plan</div><div id="eSoc">–</div>
+      <div>SOC aus Spannung</div><div id="eSocV">–</div>
+      <div>Pack</div><div id="ePack">–</div>
+      <div>über Boden</div><div id="eMargin">–</div>
+      <div>Tagesende</div><div id="eEnd">–</div>
+      <div>Daten</div><div id="eData">–</div>
+      <div>Herkunft</div><div id="eOrigin">–</div>
+    </div>
+  </div>
+
+  <div class="tile c4">
+    <h3>Sonne</h3>
+    <div class="row">
+      <div><span class="big" id="sNow">–</span><span class="unit">W Ist</span></div>
+      <div><span class="mid" id="sPlan">–</span><span class="unit">W Plan</span></div>
+      <div class="mid" id="sDelta"></div>
+    </div>
+    <div class="sub" id="sMppt"></div>
+    <div class="kv" style="margin-top:8px">
+      <div>Ertrag seit Planstart</div><div id="sCum">–</div>
+    </div>
+  </div>
+
+  <div class="tile c8">
+    <h3>Voraus</h3>
+    <table>
+      <thead><tr><th>Was</th><th class="num">in km</th><th class="num">bei km</th>
+                 <th class="num">Plan</th><th class="num">erwartet</th><th class="num">Δ min</th><th></th></tr></thead>
+      <tbody id="upcoming"></tbody>
+    </table>
+  </div>
+
+  <div class="tile c6">
+    <h3>Eingriffe</h3>
+    <div class="row">
+      <label>Position von Hand: km <input type="number" id="manKm" step="0.1" min="0"></label>
+      <button id="btnManKm">setzen</button>
+      <button id="btnGps">wieder GPS</button>
+      <button id="btnAnchor" title="Energiezähler auf die Ruhespannung setzen - nur im Stand">Anker (Stand)</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label>GPS-Gerät
+        <select id="devSelect"><option value="">(alle Geräte)</option></select>
+      </label>
+      <button id="btnDevReload" title="Geräteliste neu einlesen (letzte 30 min)">↻</button>
+      <span class="sub" id="devNote"></span>
+    </div>
+    <div class="row" id="simRow" style="margin-top:8px; display:none">
+      <label>Simulation
+        <select id="simSpeed">
+          <option value="0">Pause</option><option value="1">1×</option>
+          <option value="5">5×</option><option value="10">10×</option>
+          <option value="30">30×</option><option value="60">60×</option>
+          <option value="120">120×</option>
+        </select>
+      </label>
+      <span class="sub">nur im Simulationsmodus</span>
+    </div>
+    <div class="sub" style="margin-top:8px">
+      Neu planen: <code>point_strategy.py</code> laufen lassen, dann oben den neuen Plan wählen
+      und „Plan übernehmen“. Die Seite rechnet nichts neu.
+    </div>
+  </div>
+
+  <div class="tile c6">
+    <h3>Meldungen</h3>
+    <div class="log" id="log"></div>
+  </div>
+</main>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (x, nd = 0, dash = '–') => (x === null || x === undefined || Number.isNaN(x))
+    ? dash : Number(x).toFixed(nd);
+  const sign = (x, nd = 0, unit = '') => (x === null || x === undefined) ? '' :
+    (x > 0 ? '+' : '') + Number(x).toFixed(nd) + unit;
+  const hm = s => { if (s === null || s === undefined) return '–';
+    const neg = s < 0; s = Math.abs(Math.round(s));
+    return (neg ? '-' : '') + Math.floor(s / 3600) + ':' + String(Math.floor((s % 3600) / 60)).padStart(2, '0'); };
+  const hhmm = t => t ? t.slice(0, 5) : '–';
+  const cls = (el, c) => { el.classList.remove('good', 'bad', 'warn'); if (c) el.classList.add(c); };
+
+  let lastStatus = null;
+  let stripState = { km_from: null, km_to: null };
+
+  // ---------------------------------------------------------- canvas helpers
+  function setupCanvas(cv) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth, h = cv.clientHeight;
+    if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+      cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+    }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    return { ctx, w, h };
+  }
+  function niceStep(span, target) {
+    const raw = span / target, p = Math.pow(10, Math.floor(Math.log10(raw)));
+    for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= raw) return m * p;
+    return 10 * p;
+  }
+
+  // ---------------------------------------------------------- speed strip
+  function drawStrip(st) {
+    const cv = $('strip'); const { ctx, w, h } = setupCanvas(cv);
+    const s = st && st.strip; if (!s || !s.km_start.length) return;
+    const pos = st.position ? st.position.km : null;
+    const L = 40, R = 46, T = 14, B = 26;
+    const x0 = s.km_from, x1 = s.km_to;
+    const X = km => L + (km - x0) / (x1 - x0) * (w - L - R);
+    const vmax = Math.max(60, ...s.v_soll.filter(v => v != null), ...s.v_route.filter(v => v != null),
+                          ...s.v_limit.filter(v => v != null), ...s.v_limit_est.filter(v => v != null)) + 10;
+    const Y = v => T + (1 - v / vmax) * (h - T - B);
+    // altitude (right axis, shaded)
+    const alt = s.alt.filter(a => a != null);
+    if (alt.length) {
+      const amin = Math.min(...alt), amax = Math.max(...alt);
+      const span = Math.max(amax - amin, 60);
+      const YA = a => T + (1 - (a - amin) / span) * (h - T - B) * 0.55 + (h - T - B) * 0.45;
+      ctx.beginPath(); ctx.moveTo(X(s.km_start[0]), h - B);
+      for (let i = 0; i < s.km_start.length; i++) if (s.alt[i] != null) ctx.lineTo(X(s.km_start[i]), YA(s.alt[i]));
+      ctx.lineTo(X(s.km_end[s.km_end.length - 1]), YA(s.alt[s.alt.length - 1] ?? amin));
+      ctx.lineTo(X(s.km_end[s.km_end.length - 1]), h - B); ctx.closePath();
+      ctx.fillStyle = 'rgba(107,127,147,0.22)'; ctx.fill();
+      ctx.fillStyle = '#6b7f93'; ctx.font = '11px system-ui'; ctx.textAlign = 'right';
+      ctx.fillText(Math.round(amax) + ' m', w - 4, YA(amax) + 4);
+      ctx.fillText(Math.round(amin) + ' m', w - 4, YA(amin) + 4);
+    }
+    // grid
+    ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.lineWidth = 1;
+    ctx.fillStyle = '#8fa0b0'; ctx.font = '11px system-ui'; ctx.textAlign = 'right';
+    for (let v = 0; v <= vmax; v += 20) { ctx.beginPath(); ctx.moveTo(L, Y(v)); ctx.lineTo(w - R, Y(v)); ctx.stroke();
+      ctx.fillText(v, L - 6, Y(v) + 4); }
+    ctx.textAlign = 'center';
+    const step = niceStep(x1 - x0, 8);
+    for (let k = Math.ceil(x0 / step) * step; k <= x1; k += step) {
+      ctx.beginPath(); ctx.moveTo(X(k), T); ctx.lineTo(X(k), h - B); ctx.stroke();
+      ctx.fillText(k.toFixed(step < 1 ? 1 : 0), X(k), h - 8);
+    }
+    // step lines
+    const stepLine = (arr, color, width, dash) => {
+      ctx.strokeStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash || []);
+      ctx.beginPath(); let pen = false;
+      for (let i = 0; i < arr.length; i++) {
+        const v = arr[i]; if (v == null) { pen = false; continue; }
+        const xa = X(s.km_start[i]), xb = X(s.km_end[i]), y = Y(v);
+        if (!pen) { ctx.moveTo(xa, y); pen = true; } else ctx.lineTo(xa, y);
+        ctx.lineTo(xb, y);
+      }
+      ctx.stroke(); ctx.setLineDash([]);
+    };
+    stepLine(s.v_limit_est.map((v, i) => s.v_limit[i] == null ? v : null), '#4ade80', 1.2, [3, 4]);
+    stepLine(s.v_limit, '#4ade80', 1.6);
+    stepLine(s.v_route, '#4cc3ff', 1.4);
+    stepLine(s.v_soll, '#ffffff', 2.6);
+    // leg boundaries
+    ctx.fillStyle = '#8fa0b0'; ctx.textAlign = 'left'; ctx.font = '11px system-ui';
+    for (const l of s.legs) { ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.setLineDash([2, 3]);
+      ctx.beginPath(); ctx.moveTo(X(l.km), T); ctx.lineTo(X(l.km), h - B); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillText(l.leg, X(l.km) + 3, T + 10); }
+    // stops
+    for (const sp of s.stops) { ctx.fillStyle = 'rgba(251,191,36,0.85)';
+      ctx.fillRect(X(sp.km) - 2, T, 4, h - T - B);
+      ctx.fillStyle = '#fbbf24'; ctx.textAlign = 'left'; ctx.fillText(sp.name, X(sp.km) + 5, h - B - 6); }
+    // features
+    for (const f of s.features) { ctx.fillStyle = '#ff8fd0'; ctx.beginPath();
+      ctx.arc(X(f.km), h - B - 7, 5, 0, Math.PI * 2); ctx.fill();
+      if (f.kind === 'traffic_signal') { ctx.fillStyle = '#101418'; ctx.fillRect(X(f.km) - 1.5, h - B - 10, 3, 6); } }
+    // position marker
+    if (pos != null && pos >= x0 && pos <= x1) {
+      ctx.strokeStyle = '#f87171'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(X(pos), T); ctx.lineTo(X(pos), h - B); ctx.stroke();
+      const v = st.speed && st.speed.now; if (v != null) { ctx.fillStyle = '#f87171'; ctx.beginPath();
+        ctx.arc(X(pos), Y(v), 6, 0, Math.PI * 2); ctx.fill(); }
+      ctx.fillStyle = '#f87171'; ctx.textAlign = 'center'; ctx.font = 'bold 11px system-ui';
+      ctx.fillText('▼ ' + pos.toFixed(1), X(pos), T - 2);
+    }
+    $('stripRange').textContent = `km ${x0.toFixed(1)} – ${x1.toFixed(1)}`;
+  }
+
+  // ---------------------------------------------------------- energy chart
+  function drawEnergy(st) {
+    const cv = $('energy'); const { ctx, w, h } = setupCanvas(cv);
+    const c = st && st.curve; if (!c || !c.km.length) return;
+    const e = st.energy || {};
+    const pos = st.position ? st.position.km : null;
+    const L = 48, R = 14, T = 12, B = 26;
+    const x0 = 0, x1 = c.km[c.km.length - 1];
+    const ymax = Math.max(c.wh_cap || 0, ...c.wh_plan) * 1.03;
+    const X = km => L + (km - x0) / (x1 - x0) * (w - L - R);
+    const Y = wh => T + (1 - wh / ymax) * (h - T - B);
+    ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.lineWidth = 1; ctx.fillStyle = '#8fa0b0';
+    ctx.font = '11px system-ui'; ctx.textAlign = 'right';
+    const ys = niceStep(ymax, 6);
+    for (let v = 0; v <= ymax; v += ys) { ctx.beginPath(); ctx.moveTo(L, Y(v)); ctx.lineTo(w - R, Y(v)); ctx.stroke();
+      ctx.fillText(Math.round(v), L - 6, Y(v) + 4); }
+    ctx.textAlign = 'center';
+    const xs = niceStep(x1 - x0, 8);
+    for (let k = 0; k <= x1; k += xs) { ctx.beginPath(); ctx.moveTo(X(k), T); ctx.lineTo(X(k), h - B); ctx.stroke();
+      ctx.fillText(Math.round(k), X(k), h - 8); }
+    // cap line
+    if (c.wh_cap) { ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.setLineDash([4, 4]); ctx.beginPath();
+      ctx.moveTo(L, Y(c.wh_cap)); ctx.lineTo(w - R, Y(c.wh_cap)); ctx.stroke(); ctx.setLineDash([]); }
+    // floor
+    ctx.strokeStyle = '#f87171'; ctx.lineWidth = 1.4; ctx.setLineDash([6, 4]); ctx.beginPath();
+    c.km.forEach((k, i) => i ? ctx.lineTo(X(k), Y(c.wh_floor[i])) : ctx.moveTo(X(k), Y(c.wh_floor[i]))); ctx.stroke(); ctx.setLineDash([]);
+    // stops
+    for (const s of c.stops) { ctx.fillStyle = 'rgba(251,191,36,0.35)'; ctx.fillRect(X(s.km) - 1, T, 2, h - T - B); }
+    // plan
+    ctx.strokeStyle = '#9aa7ff'; ctx.lineWidth = 2; ctx.beginPath();
+    c.km.forEach((k, i) => i ? ctx.lineTo(X(k), Y(c.wh_plan[i])) : ctx.moveTo(X(k), Y(c.wh_plan[i]))); ctx.stroke();
+    // trail: live and voltage-SOC
+    if (c.trail && c.trail.length) {
+      ctx.strokeStyle = '#ff8fd0'; ctx.lineWidth = 1.2; ctx.setLineDash([2, 3]); ctx.beginPath(); let pen = false;
+      for (const [k, , wv] of c.trail) { if (wv == null) { pen = false; continue; } pen ? ctx.lineTo(X(k), Y(wv)) : ctx.moveTo(X(k), Y(wv)); pen = true; }
+      ctx.stroke(); ctx.setLineDash([]);
+      ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2.4; ctx.beginPath();
+      c.trail.forEach(([k, wl], i) => i ? ctx.lineTo(X(k), Y(wl)) : ctx.moveTo(X(k), Y(wl))); ctx.stroke();
+    }
+    // current point + voltage band
+    if (pos != null) {
+      ctx.strokeStyle = '#f87171'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(X(pos), T); ctx.lineTo(X(pos), h - B); ctx.stroke();
+      if (e.wh_v_lo != null) { ctx.strokeStyle = '#ff8fd0'; ctx.lineWidth = 6; ctx.globalAlpha = 0.55; ctx.beginPath();
+        ctx.moveTo(X(pos) + 6, Y(e.wh_v_lo)); ctx.lineTo(X(pos) + 6, Y(e.wh_v_hi)); ctx.stroke(); ctx.globalAlpha = 1; }
+      if (e.wh_live != null) { ctx.fillStyle = '#fbbf24'; ctx.beginPath(); ctx.arc(X(pos), Y(e.wh_live), 6, 0, Math.PI * 2); ctx.fill(); }
+      if (e.wh_plan != null) { ctx.strokeStyle = '#9aa7ff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(X(pos), Y(e.wh_plan), 6, 0, Math.PI * 2); ctx.stroke(); }
+    }
+    ctx.fillStyle = '#8fa0b0'; ctx.textAlign = 'left'; ctx.fillText('Wh', 4, T + 4);
+    ctx.textAlign = 'right'; ctx.fillText('km ab Planstart', w - R, h - 8);
+  }
+
+  // ---------------------------------------------------------- render
+  function render(st) {
+    lastStatus = st;
+    $('clock').textContent = st.now || '--:--:--';
+    const src = st.source || {};
+    // header dots
+    const tel = st.telemetry || {};
+    const age = src.series_age_s;
+    const dTel = $('dotTel');
+    if (src.kind === 'simulation') {
+      dTel.className = 'dot ' + (src.sim_paused ? 'warn' : 'ok');
+      $('telText').textContent = `Simulation ${src.sim_paused ? 'pausiert' : src.sim_speed + '×'} · ${tel.rows || 0} s`;
+      $('simRow').style.display = 'flex';
+      if (document.activeElement !== $('simSpeed')) $('simSpeed').value = String(src.sim_speed ?? 1);
+    }
+    else if (age == null) { dTel.className = 'dot bad'; $('telText').textContent = `Telemetrie: keine Daten (${src.host || ''})` + (src.last_error ? ' · ' + src.last_error : ''); }
+    else { dTel.className = 'dot ' + (age <= 5 ? 'ok' : age <= 30 ? 'warn' : 'bad');
+      $('telText').textContent = `Telemetrie ${age} s alt` + (tel.gap ? ' · Lücke (0 V)' : '') + (src.last_error ? ' · ' + src.last_error : ''); }
+    const p = st.position;
+    const dG = $('dotGps');
+    if (!p) { dG.className = 'dot bad'; $('gpsText').textContent = 'GPS: keine Position'; }
+    else if (p.source === 'manual') { dG.className = 'dot warn'; $('gpsText').textContent = 'Position von Hand'; }
+    else { const a = p.fix_age_s; dG.className = 'dot ' + (a == null ? 'bad' : a <= 10 ? 'ok' : a <= 60 ? 'warn' : 'bad');
+      $('gpsText').textContent = `GPS ${a == null ? '?' : a + ' s'}` + (src.device ? ` (${src.device})` : '')
+        + (p.off_route ? ` · ${p.cross_m} m neben Plan!` : p.cross_m != null ? ` · ${p.cross_m} m` : ''); }
+
+    if (!st.plan) { $('planLabel').textContent = st.message || 'kein Plan geladen'; renderLog(st); return; }
+    const fin = st.finish;
+    $('planLabel').textContent = `${st.plan.label} · Ziel Plan ${hhmm(st.plan.t_finish)}`
+      + (fin ? ` · erwartet ${hhmm(fin.t_live)}` : '') + ` · Deadline ${hhmm(st.plan.t_deadline)}`
+      + (fin && fin.late_min != null && fin.late_min > 0 ? ` · ${fmt(fin.late_min, 0)} MIN ZU SPÄT` : '')
+      + (st.plan.cloud_margin != null ? ` · Wolkenmarge ${st.plan.cloud_margin} %` : '');
+    cls($('planLabel'), fin && fin.late_min != null ? (fin.late_min > 0 ? 'bad' : fin.late_min > -5 ? 'warn' : null) : null);
+
+    // speed
+    const v = st.speed || {};
+    $('vNow').textContent = fmt(v.now);
+    const halted = p && p.at_stop && (v.now == null || v.now < 3);
+    $('vSoll').textContent = halted ? 'Halt' : fmt(v.soll);
+    const dv = halted ? null : v.delta; $('vDelta').textContent = dv == null ? '' : sign(dv);
+    cls($('vDelta'), dv == null ? null : Math.abs(dv) <= 3 ? 'good' : Math.abs(dv) <= 8 ? 'warn' : 'bad');
+    const SRC = { can: 'Tempo aus der Telemetrie (CAN)', can_alt: 'Tempo aus der Telemetrie — VERALTET',
+                  gps: 'Tempo aus GPS (CAN fehlt)', gps_alt: 'Tempo aus GPS — VERALTET' };
+    $('vSub').textContent = v.soll == null ? (SRC[v.source] || '') :
+      `v_route ${fmt(v.v_route)} · Limit ${v.v_limit != null ? v.v_limit : (v.v_limit_est != null ? '~' + v.v_limit_est : '?')}`
+      + (v.at_cap ? ' · Soll am Routing-Deckel (Prognose, nicht Anweisung)' : '') + (v.source ? ` · ${SRC[v.source] || v.source}` : '');
+    cls($('vNow'), (v.source === 'can' || v.source == null) ? null : 'warn');
+    const z = $('zones'); z.innerHTML = '';
+    (v.next_zones || []).slice(0, 4).forEach((zn, i) => { const d = document.createElement('div'); d.className = 'zone';
+      d.innerHTML = i === 0 ? `<b>${fmt(zn.v)}</b> noch ${fmt(zn.to_km - (p ? p.km : 0), 1)} km` : `<b>${fmt(zn.v)}</b> in ${fmt(zn.in_km, 1)} km · ${fmt(zn.len_km, 1)} km`; z.appendChild(d); });
+
+    // position
+    if (p) {
+      $('posKm').textContent = fmt(p.km, 1);
+      $('posTotal').textContent = `von ${fmt(st.plan.total_km, 1)} · noch ${fmt(p.remaining_km, 1)} km`;
+      $('posLeg').textContent = `${p.leg}: km ${fmt(p.leg_km, 1)} von ${fmt(p.leg_len, 1)} · ${p.altitude_m ?? '?'} m`;
+      const sm = p.schedule_min; const el = $('posSched');
+      el.textContent = (sm == null ? '–' : (Math.abs(sm) < 0.5 ? 'im Plan' : (sm > 0 ? `${fmt(sm, 0)} min hinter dem Plan` : `${fmt(-sm, 0)} min vor dem Plan`)))
+        + (p.at_stop ? ` · steht: ${p.at_stop}` : ` (Plan hier ${hhmm(p.t_plan_here)})`);
+      // halt box: the number the crew acts on is "from when may we go"
+      const hb = $('haltBox');
+      if (p.at_stop) {
+        hb.style.display = 'block';
+        $('haltFree').textContent = hhmm(p.halt_free_at);
+        cls($('haltFree'), p.halt_free_s === 0 ? 'good' : null);
+        $('haltPlan').textContent = (p.halt_free_s > 0 ? `noch ${hm(p.halt_free_s)}` : 'Reglement erfüllt')
+          + (p.halt_reg_min != null ? ` (${fmt(p.halt_reg_min, 0)} min Reglement)` : '')
+          + ` · Plan rechnet bis ${hhmm(p.halt_leave)}`;
+        $('haltArr').textContent = `angekommen ${hhmm(p.halt_arrived)} `
+          + (p.halt_source === 'confirmed' ? '(bestätigt)' : '(aus der Geschwindigkeit — bei Bedarf bestätigen)');
+        cls($('haltArr'), p.halt_source === 'confirmed' ? 'good' : null);
+        $('stopAt').placeholder = hhmm(p.halt_arrived) || 'HH:MM';
+      } else hb.style.display = 'none';
+      cls(el, sm == null ? null : sm > 10 ? 'bad' : sm > 3 ? 'warn' : 'good');
+      $('posSrc').textContent = p.source === 'manual' ? 'von Hand gesetzt' : `GPS, ${p.cross_m ?? '?'} m neben der Route`;
+      $('manKm').placeholder = fmt(p.km, 1);
+    } else { $('posKm').textContent = '–'; $('posTotal').textContent = ''; $('posLeg').textContent = 'keine Position - GPS abwarten oder km von Hand setzen'; $('posSched').textContent = '–'; $('posSrc').textContent = '–'; }
+
+    // next arrival
+    const n = st.next;
+    if (n) { $('nextName').textContent = n.name + (n.dur_min ? ` (${n.dur_min} min)` : '');
+      $('nextLive').textContent = hhmm(n.t_live); $('nextPlan').textContent = hhmm(n.t_plan);
+      const d = n.delta_min; const sub = $('nextSub');
+      sub.textContent = `in ${fmt(n.dist_km, 1)} km · bis dahin ${hm(n.travel_s)}${p && p.at_stop ? ' (inkl. Rest-Halt)' : ''}` + (d == null ? '' : ` · ${d > 0 ? sign(d, 0) + ' min später' : d < 0 ? fmt(-d, 0) + ' min früher' : 'pünktlich'}`);
+      cls($('nextLive'), d == null ? null : d > 10 ? 'bad' : d > 3 ? 'warn' : 'good'); }
+    else { $('nextName').textContent = '–'; $('nextLive').textContent = '–'; $('nextPlan').textContent = '–'; $('nextSub').textContent = ''; }
+
+    // driver
+    const d = st.driver || {};
+    $('drvTime').textContent = d.drive_hm || '–'; $('drvLeft').textContent = d.left_hm || '–';
+    const frac = d.drive_s == null ? 0 : Math.min(100, d.drive_s / 7200 * 100);
+    const bar = $('drvBar'); bar.style.width = frac + '%'; bar.style.background = d.overdue ? 'var(--bad)' : frac > 80 ? 'var(--warn)' : 'var(--good)';
+    cls($('drvLeft'), d.overdue ? 'bad' : frac > 80 ? 'warn' : null);
+    const lt = $('drvLatest');
+    if (d.overdue) { lt.textContent = 'ÜBERFÄLLIG — die zwei Stunden sind um'; cls(lt, 'bad'); }
+    else if (d.standing && (d.drive_s === 0)) { lt.textContent = 'Auto steht — Zähler läuft nicht'; cls(lt, null); }
+    else if (d.latest && d.latest.reset_by) { lt.textContent = `kein Wechsel nötig: ${d.latest.reset_by} bei km ${fmt(d.latest.km, 1)} (in ${fmt(d.latest.in_km, 1)} km) ist die Pause`; cls(lt, 'good'); }
+    else if (d.latest) { lt.textContent = `spätestens ${hhmm(d.latest.t)} bei km ${fmt(d.latest.km, 1)} (in ${fmt(d.latest.in_km, 1)} km)`; cls(lt, d.left_s != null && d.left_s < 600 ? 'warn' : null); }
+    else { lt.textContent = ''; cls(lt, null); }
+    $('drvNext').textContent = d.next_change ? `Plan: Wechsel bei km ${fmt(d.next_change.km, 1)} (in ${fmt(d.next_change.dist_km, 1)} km), ${hhmm(d.next_change.t_plan)} / erwartet ${hhmm(d.next_change.t_live)}`
+      : (d.planned_km && d.planned_km.length ? `Plan: Wechsel bei km ${d.planned_km.join(', ')} (alle passiert)` : 'kein Wechsel im Plan');
+    $('drvLog').textContent = (d.log && d.log.length)
+      ? 'bestätigt: ' + d.log.map(e => e.t.slice(0, 5) + (e.km != null ? ` (km ${fmt(e.km, 1)})` : '')).join(' · ')
+      : 'noch kein Wechsel bestätigt';
+
+    // energy
+    const e = st.energy || {};
+    $('eLive').textContent = fmt(e.wh_live); $('ePlan').textContent = fmt(e.wh_plan);
+    const de = e.delta_wh; $('eDelta').textContent = de == null ? '' : sign(de, 0, ' Wh');
+    cls($('eDelta'), de == null ? null : de >= -50 ? 'good' : de >= -200 ? 'warn' : 'bad');
+    const cmp = e.compared_at === 'stop' ? 'Vergleich zeitbasiert im Halt' : e.compared_at === 'km' ? 'Vergleich am gleichen km' : '';
+    $('eSplit').textContent = e.split_note ? `${e.split_note} · ${cmp}` : (e.delta_solar_wh == null) ? cmp
+      : `davon Sonne ${sign(e.delta_solar_wh, 0)} Wh · Verbrauch ${sign(-e.delta_load_wh, 0)} Wh (positiv = besser) · ${cmp}`;
+    $('eSoc').textContent = `${fmt(e.soc_live, 0)} % / ${fmt(e.soc_plan, 0)} %`;
+    const sv = $('eSocV');
+    if (e.soc_v != null) { sv.textContent = `${fmt(e.soc_v, 0)} % (${fmt(e.soc_v_lo, 0)}–${fmt(e.soc_v_hi, 0)} %) · ${e.live_in_band ? 'Ist im Band' : 'Ist AUSSERHALB'}`; cls(sv, e.live_in_band ? 'good' : 'warn'); }
+    else { sv.textContent = '–'; cls(sv, null); }
+    $('ePack').textContent = e.v_pack == null ? '–' : `${fmt(e.v_pack, 1)} V · ${sign(e.i_batt, 1)} A · ${fmt(e.p_batt)} W ${e.p_batt > 0 ? 'aus dem Pack' : 'ins Pack'}`;
+    const mg = $('eMargin'); mg.textContent = e.margin_wh == null ? '–' : `${sign(e.margin_wh, 0)} Wh (Boden hier ${fmt(e.wh_floor)} Wh)`;
+    cls(mg, e.margin_wh == null ? null : e.margin_wh < 100 ? 'bad' : e.margin_wh < 300 ? 'warn' : 'good');
+    $('eEnd').textContent = e.projected_end_wh == null ? `Plan ${fmt(e.end_wh_plan)} Wh (${fmt(st.plan.end_soc)} %)`
+      : `hochgerechnet ${fmt(e.projected_end_wh)} Wh (${fmt(e.projected_end_soc)} %) · Plan ${fmt(e.end_wh_plan)} Wh (${fmt(st.plan.end_soc)} %)`;
+    $('eData').textContent = `${e.n_samples || 0} Samples · ${e.n_gaps || 0} Lücken (${fmt(e.wh_bridged)} Wh überbrückt) · ${e.n_rejected || 0} verworfen`
+      + (e.n_anchors ? ` · ${e.n_anchors} Anker` : '') + (e.wh_spilled > 5 ? ` · ${fmt(e.wh_spilled)} Wh bei vollem Pack verworfen` : '');
+    $('eOrigin').textContent = e.integrated_from
+      ? `Ist = ${fmt(e.wh_start)} Wh (Planstart: ${e.wh_start_source || '?'}) + V·I integriert ab ${hhmm(e.integrated_from)}`
+      : 'Ist: noch keine Samples integriert';
+
+    // sun
+    const s = st.sun || {};
+    $('sNow').textContent = fmt(s.p_now); $('sPlan').textContent = fmt(s.p_plan);
+    $('sDelta').textContent = s.delta_p == null ? '' : sign(s.delta_p, 0, ' W');
+    cls($('sDelta'), s.delta_p == null ? null : s.delta_p >= -50 ? 'good' : s.delta_p >= -200 ? 'warn' : 'bad');
+    $('sMppt').textContent = (s.mppt && s.mppt.length) ? 'MPPT ' + s.mppt.map((x, i) => `${i + 1}: ${fmt(x)} W`).join(' · ') : '';
+    $('sCum').textContent = `${fmt(s.wh_measured)} Wh gemessen · ${fmt(s.wh_plan)} Wh Prognose` + (s.wh_measured != null && s.wh_plan != null ? ` (${sign(s.wh_measured - s.wh_plan, 0)} Wh)` : '');
+
+    // upcoming
+    const tb = $('upcoming'); tb.innerHTML = '';
+    (st.upcoming || []).forEach(u => { const tr = document.createElement('tr');
+      const dm = u.delta_min; const c = dm == null ? '' : dm > 10 ? 'bad' : dm > 3 ? 'warn' : 'good';
+      if (u.type === 'finish' && u.late_min != null && u.late_min > 0) tr.style.background = 'rgba(248,113,113,0.15)';
+      tr.innerHTML = `<td>${u.name}${u.type === 'finish' ? ` <span class="sub">Deadline ${hhmm(u.deadline)}${u.late_min > 0 ? ', ' + fmt(u.late_min, 0) + ' min zu spät' : ''}</span>` : ''}${u.dur_min ? ` <span class="sub">${u.dur_min} min, ${sign(u.wh_gain)} Wh</span>` : ''}</td>
+        <td class="num">${fmt(u.dist_km, 1)}</td><td class="num">${fmt(u.km, 1)}</td>
+        <td class="num">${hhmm(u.t_plan)}</td><td class="num">${hhmm(u.t_live)}</td>
+        <td class="num ${c}">${dm == null ? '' : sign(dm, 0)}</td><td class="sub">${u.type === 'feature' ? (u.kind === 'roundabout' ? 'Kreisel' : 'Ampel') : ''}</td>`;
+      tb.appendChild(tr); });
+
+    drawStrip(st); drawEnergy(st); renderLog(st);
+  }
+  function renderLog(st) {
+    const lines = [...(st.messages || []), ...((st.notes || []).map(n => '· ' + n))];
+    $('log').textContent = lines.join('\n');
+  }
+
+  // ---------------------------------------------------------- plans + actions
+  async function loadPlanList() {
+    try { const r = await fetch('/api/plans'); const d = await r.json();
+      const sel = $('planSelect'); const cur = sel.value; sel.innerHTML = '<option value="">Plan wählen …</option>';
+      for (const p of d.plans) { const o = document.createElement('option'); o.value = p.file;
+        const t = new Date(p.created_utc); const created = isNaN(t) ? '' : ` [gerechnet ${t.toLocaleTimeString('de-CH', { hour: '2-digit', minute: '2-digit' })}]`;
+        o.textContent = (p.active ? '● ' : '') + p.label + created; sel.appendChild(o); }
+      if (cur) sel.value = cur;
+    } catch (e) { console.warn(e); }
+  }
+  async function post(url, body) {
+    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    const d = await r.json(); if (!r.ok || d.ok === false) alert(d.error || 'Fehler'); return d;
+  }
+  $('btnLoad').onclick = async () => { const f = $('planSelect').value; if (!f) { alert('zuerst einen Plan wählen'); return; }
+    if (lastStatus && lastStatus.plan && !confirm(`Plan wechseln?\n\n${$('planSelect').selectedOptions[0].textContent}\n\nDie Energie-Integration startet neu vom Startzustand dieses Plans.`)) return;
+    await post('/api/plan', { file: f }); loadPlanList(); };
+  $('btnReload').onclick = loadPlanList;
+
+  // --- GPS device picker. The app has no endpoint that lists devices, so
+  // the server derives them from the last 30 min of /api/gps/range - a
+  // device silent for longer is not offered (and is not the car).
+  let devTouched = false;
+  async function loadDevices() {
+    try {
+      const r = await fetch('/api/devices'); const d = await r.json();
+      const sel = $('devSelect');
+      const keep = devTouched ? sel.value : d.current || '';
+      sel.innerHTML = '<option value="">(alle Geräte)</option>';
+      let seen = false;
+      for (const dev of d.devices) {
+        const o = document.createElement('option');
+        o.value = dev.device;
+        // a fix a second "in the future" is clock skew between phone and
+        // laptop, not news; only a real gap is worth showing
+        o.textContent = (dev.device || '(ohne Namen)') + ` — ${dev.n} Fixe, letzter vor `
+          + (dev.age_s < -5 ? `${fmt(-dev.age_s, 0)} s IN DER ZUKUNFT (Uhren prüfen)` : `${fmt(Math.max(0, dev.age_s), 0)} s`);
+        sel.appendChild(o); if (dev.device === keep) seen = true;
+      }
+      if (keep && !seen) {  // configured but silent - keep it selectable
+        const o = document.createElement('option');
+        o.value = keep; o.textContent = keep + ' — meldet gerade nicht';
+        sel.appendChild(o);
+      }
+      sel.value = keep;
+      $('devNote').textContent = d.note ? `Fehler: ${d.note}`
+        : (d.devices.length ? '' : `kein Gerät hat in ${fmt(d.window_min, 0)} min gemeldet — meldet OsmAnd? (URL braucht &device=)`);
+    } catch (e) { console.warn(e); }
+  }
+  $('devSelect').onchange = async () => {
+    devTouched = true;
+    await post('/api/device', { device: $('devSelect').value });
+  };
+  $('btnDevReload').onclick = loadDevices;
+
+  // --- driver change: the counter runs off the speed signal and cannot
+  // see who is at the wheel, so a confirmation overrides it.
+  $('btnDrv').onclick = async () => {
+    if (!confirm('Fahrerwechsel bestätigen? Die zwei Stunden starten neu.')) return;
+    await post('/api/driver-change', {}); $('drvAt').value = '';
+  };
+  $('btnDrvAt').onclick = async () => {
+    const at = $('drvAt').value.trim();
+    if (!at) { alert('Uhrzeit HH:MM eintragen, oder „Fahrerwechsel jetzt“ drücken'); return; }
+    await post('/api/driver-change', { at }); $('drvAt').value = '';
+  };
+
+  // --- halt arrival: the speed signal only knows what it has seen since
+  // the plan started, so the crew can state when the car actually stopped
+  $('btnStop').onclick = async () => {
+    await post('/api/stop-confirm', {}); $('stopAt').value = '';
+  };
+  $('btnStopAt').onclick = async () => {
+    const at = $('stopAt').value.trim();
+    if (!at) { alert('Uhrzeit HH:MM eintragen, oder „Stopp jetzt“ drücken'); return; }
+    await post('/api/stop-confirm', { at }); $('stopAt').value = '';
+  };
+
+  $('simSpeed').onchange = () => post('/api/sim', { speed: parseFloat($('simSpeed').value) });
+  $('btnManKm').onclick = () => { const km = parseFloat($('manKm').value); if (Number.isNaN(km)) return; post('/api/position', { km }); };
+  $('btnGps').onclick = () => post('/api/position/gps');
+  $('btnAnchor').onclick = () => { if (confirm('Anker nur im Stand nach einigen Minuten Ruhe setzen. Jetzt setzen?')) post('/api/anchor'); };
+
+  async function tick() {
+    try { const r = await fetch('/api/status'); const st = await r.json(); render(st); document.body.classList.remove('stale'); }
+    catch (e) { document.body.classList.add('stale'); }
+  }
+  window.addEventListener('resize', () => lastStatus && (drawStrip(lastStatus), drawEnergy(lastStatus)));
+  loadPlanList(); loadDevices(); tick();
+  setInterval(tick, 1000); setInterval(loadPlanList, 30000);
+  setInterval(loadDevices, 20000);
+})();
+</script>
+</body>
+</html>

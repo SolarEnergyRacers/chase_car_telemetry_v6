@@ -655,8 +655,16 @@ def _evaluate_once(state, parts: dict, n_loops: int, car: Car_coeffs,
             detail = total_Ws_for_lap(leg.route, leg.weather, car,
                                       start_time=t, speeds=leg_speeds,
                                       return_detail=True)
+            # Node coordinates of the segment START, so a plan can be
+            # projected onto later (live tracking). The compiled route
+            # carries them anyway; without them the plan file could say
+            # "km 184.2" but not where on the map that is - and on a loop
+            # day the same road appears in the trace several times, so
+            # only the unrolled trace itself can resolve which pass it is.
             detail = detail.assign(
                 leg=leg.name, kind="drive", panel="flat",
+                lat=leg.route["latitude"].to_numpy()[:-1],
+                lon=leg.route["longitude"].to_numpy()[:-1],
                 v_route=leg.route["speed_route"].to_numpy()[:-1],
                 v_limit=(leg.route["speed_limit"].to_numpy()[:-1]
                          if "speed_limit" in leg.route.columns else np.nan),
@@ -732,6 +740,8 @@ def _evaluate_once(state, parts: dict, n_loops: int, car: Car_coeffs,
                     "leg": [leg.name],
                     "kind": ["stop"],
                     "panel": [panel],
+                    "lat": [lat],
+                    "lon": [lon],
                     "v_route": [np.nan],
                     "v_limit": [np.nan],
                     "v_limit_est": [np.nan],

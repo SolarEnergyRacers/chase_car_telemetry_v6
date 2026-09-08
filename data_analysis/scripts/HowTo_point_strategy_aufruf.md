@@ -75,6 +75,8 @@ Naive Eingaben gelten als SAST, nie als UTC.
 | `--n-max 10` | wie viele Loop-Zahlen die Tabelle durchrechnet |
 | `--plot` | beide Anzeigen in Fenstern öffnen |
 | `--plot-png [PREFIX]` | zusätzlich als PNG schreiben |
+| `--no-save` | keine Plandateien schreiben (Default: jede machbare Option landet in `plans/`, siehe unten) |
+| `--plans-dir DIR` | Zielordner der Plandateien (Default `data_analysis/plans`, oder `$SSC_PLANS_DIR`) |
 | `--spacing-km 5.0` | muss zu `cache_weather.py` passen |
 | `-v` | Info-Logging |
 
@@ -195,6 +197,18 @@ einer Ortsdurchfahrt ist die Geschwindigkeit vorgegeben, nicht gewählt. Die
 verlässliche Information ist dort die **Sollzeit** („bei km 98.6 um 11:14").
 
 ---
+
+## Plandateien für die Live-Anzeige
+
+Jeder Lauf schreibt seine machbaren Optionen als Plandateien nach
+`data_analysis/plans/` (im Plan-Modus die eine, in der Optionstabelle jede
+machbare Zeile). Die Dateien sind selbständig - Trace mit Koordinaten,
+Standphasen, Fahrerwechsel, Startzustand des Packs - und werden von
+`live_strategy.py` im Menü „Plan“ angeboten. Dort wird erst entschieden,
+welcher gefahren wird; deshalb schreibt der Lauf alle und nicht nur die
+beste. Aufrufe, die man nicht behalten will, bekommen `--no-save`.
+
+Siehe `HowTo_live_strategy.md`.
 
 ## Stolperstellen
 
