@@ -84,7 +84,13 @@ def parse_range_json(payload: dict) -> pd.DataFrame:
     pts = payload.get("points") or []
     if not pts:
         return pd.DataFrame(columns=cols, index=pd.DatetimeIndex([], tz="UTC"))
-    ts = pd.to_datetime([p["timestamp"] for p in pts], utc=True)
+    # format="ISO8601" and not the default: the app serialises a stamp on a
+    # whole second without its fractional part, so a batch is a MIXTURE of
+    # "...:00.123Z" and "...:00Z". pandas infers one format from the first
+    # element and then applies it strictly - one round second in a thousand
+    # samples and the whole poll raises instead of returning rows.
+    ts = pd.to_datetime([p["timestamp"] for p in pts], utc=True,
+                        format="ISO8601")
     vals = np.array([[np.nan if v is None else float(v)
                       for v in p["values"]] for p in pts], dtype=float)
     df = pd.DataFrame(vals, columns=cols, index=ts)

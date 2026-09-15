@@ -62,6 +62,84 @@ Plausibilitätswert, und der Unterschied steht in der Kopfzeile.
 
 Naive Eingaben gelten als SAST, nie als UTC.
 
+### Panel
+
+| Argument | Bedeutung |
+|---|---|
+| `--flat-panel` | das Panel wird **nicht** ausgerichtet und bleibt flach liegen |
+| `--no-flat-panel` | nimmt einen Default aus `SSC_FLAT_PANEL` für diesen Lauf zurück |
+| `--aim-morning` | nur mit `--flat-panel`: im Morgenfenster am Nachtquartier doch ausgerichtet |
+
+`--flat-panel` gilt für **jeden** Halt — Kontrollstopp, Loopstopps, `--stop`,
+`--sweep-stop`, Fahrerwechsel und die Restzeit vor der Ziellinie — und für das
+Morgenfenster. Die **Standzeiten bleiben unverändert**: die dreissig regulierten
+Minuten am Kontrollstopp sind geschuldet, ob dabei geladen wird oder nicht. Es
+ändert sich nur die Einstrahlung, mit der der Halt rechnet: GHI statt
+nachgeführtes GTI.
+
+Weil das ein Zustand des Autos ist und nicht eine Entscheidung pro Lauf, lässt
+sich der Default setzen:
+
+```
+export SSC_FLAT_PANEL=1        # Linux/macOS
+$env:SSC_FLAT_PANEL = "1"      # PowerShell
+```
+
+Das ist unkritisch, weil die **Kopfzeile den Panelzustand ausgibt**, sobald er
+nicht der Normalfall ist — ein flacher Plan kann also nicht versehentlich als
+ausgerichteter gelesen werden. Zusätzlich stehen `Panel flach` im Plantitel,
+über der Optionstabelle, im Plot und im Label der Plandatei, und die Datei
+selbst bekommt `_flach` in den Namen sowie `panel_flat: true` im `meta`.
+
+**Das Morgenfenster ist bewusst mitbetroffen.** Morgens zwischen 06:00 und 08:00
+steht die Sonne tief, und das Verhältnis nachgeführt/flach geht gegen
+1/sin(Elevation) — dort kann die Annahme um einen Faktor zwei falsch liegen. Der
+Fehler hätte auch eine unangenehme Richtung: ein zu hohes „angeboten" **senkt**
+die Obergrenze für die Ankunftsenergie und würde raten, leerer anzukommen, als
+das Morgenfenster wieder auffüllen kann. Wer das Panel am Nachtquartier von Hand
+aufbocken kann — was etwas anderes ist als Ausrichten in einer
+Fünf-Minuten-Loop-Pause — nimmt das mit `--aim-morning` zurück.
+
+Was mit flachem Panel **nicht** mehr gilt: die Standphase vor der Ziellinie war
+energetisch attraktiv, weil ein nachgeführtes Panel dort spätnachmittags rund
++150 % gegenüber flach bringt. Flach ist flach, dieser Gewinn fällt weg. Die
+Phase bleibt trotzdem im Plan — ihr Grund ist der 50-km/h-Penalty, nicht der
+Ertrag. Die Zeile „Alternative" unter der Penalty-Warnung sagt das jetzt auch so.
+
+### Standladen: Panel pro Halt wählen
+
+`--stop` und `--sweep-stop` nehmen ein optionales drittes Feld, das **nur für
+diesen einen Halt** gilt und die Tageseinstellung überstimmt:
+
+| Schreibweise | Bedeutung |
+|---|---|
+| `--stop 45:30` | folgt dem Tag (flach mit `--flat-panel`, sonst ausgerichtet) |
+| `--stop 45:30:aus` | ausgerichtet, auch auf einem `--flat-panel`-Tag |
+| `--stop 45:30:flach` | flach, auch ohne `--flat-panel` |
+| `--stop 45:45:20` | 20 der 45 Minuten ausgerichtet, den Rest flach |
+| `--sweep-stop=-1:aus` | Sweep 1 km vor dem Ziel, ausgerichtet gerechnet |
+
+Statt `aus` gehen auch `ausgerichtet`, `aim`, `tracked`; statt `flach` auch
+`flat`, `ghi`, `nein`.
+
+Das ist der Halt, an dem die Wahl überhaupt Sinn ergibt: vierzig Minuten
+Standladen reichen, um das Panel von Hand aufzubocken oder das Auto zu drehen,
+eine Fünf-Minuten-Loop-Pause nicht. Deshalb überstimmt `aus` hier auch ein
+global gesetztes `--flat-panel`, während Kontroll- und Loopstopps davon
+unberührt bleiben.
+
+Die Minutenzahl gibt es, weil ein langer Halt oft nur halb betreut ist — das
+Panel wird ausgerichtet, solange die Crew ohnehin draussen ist, und liegt vor
+dem Losfahren wieder flach. Bei `--sweep-stop` ist eine Minutenzahl abgelehnt:
+dort variiert die Haltedauer selbst, eine feste Minutenzahl wäre bei 15 min
+Halt alles und bei 120 min ein Achtel, und die Kurve sagt dann über keines von
+beidem etwas.
+
+Ein Halt, der vom Tag abweicht, **steht so im Plan**: `Standladen km 45.0
+(ausgerichtet)` bzw. `(flach)` bzw. `(20 min ausgerichtet)`. Die Sweep-Tabelle
+bekommt es in die Überschrift. Stimmt der Halt mit dem Tag überein, bleibt der
+Name wie bisher.
+
 ### Modus und Rechnung
 
 | Argument | Bedeutung |
@@ -155,6 +233,25 @@ deshalb oft **nicht** die mit dem höchsten End-SOC. Gewinne unter 30 Wh gelten
 als gleichwertig, und der kürzere Halt gewinnt: längeres Stehen heisst
 schneller fahren und damit tieferen minimalen SOC unterwegs.
 
+### Panel klemmt, Optionstabelle für den Tag
+
+```
+python point_strategy.py --day 5 --part to_control --km 0 --soc 57 \
+       --time 08:00 --flat-panel
+```
+
+Der direkte Vergleich, was die fehlende Ausrichtung kostet — einmal mit und
+einmal ohne das Flag laufen lassen. Beide Läufe schreiben ihre Plandateien,
+unterscheidbar am `_flach` im Namen.
+
+Und die Mischform: Tag flach, aber am langen Standladen wird von Hand
+aufgebockt.
+
+```
+python point_strategy.py --day 5 --plan 2 --flat-panel --stop 45:40:aus
+```
+
+
 ### Fahrerwechsel selbst setzen
 
 ```
@@ -222,6 +319,14 @@ liegt. Sonst wird der Pfad selbst gefunden.
 Nach jedem Routenabruf `cache_weather.py N` laufen lassen, damit der
 Nachtquartierpunkt für Tag N+1 mitkommt. Ohne ihn greift der Rückfall über die
 Route des Folgetags, und der scheitert an den Blind Stages.
+
+`SSC_FLAT_PANEL` wirkt auf **alle** Läufe in dieser Shell. Wenn eine Zahl nicht
+zu einer früheren passt, zuerst die Kopfzeile vergleichen: steht dort `Panel
+flach`, ist es das.
+
+Selbsttest für den Panelpfad, ohne Routen und ohne Wettercache:
+`python scripts/test_flat_panel.py` (aus `data_analysis/`, mit `src` im
+`PYTHONPATH`).
 
 Für Fenster statt PNG braucht matplotlib ein GUI-Backend. Fehlt es, wird das
 gemeldet und stattdessen PNG geschrieben — unter Windows genügt meist

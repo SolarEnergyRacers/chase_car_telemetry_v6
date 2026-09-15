@@ -128,6 +128,15 @@
         <button id="btnStopAt" title="Ankunft nachtragen">nachtragen</button>
       </div>
     </div>
+    <div id="loopBox" style="display:none; margin-top:8px; padding-top:8px; border-top:1px solid var(--line)">
+      <div class="sub" id="loopNow">–</div>
+      <div class="row" style="margin-top:6px; gap:6px">
+        <select id="loopNr" style="background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 8px"></select>
+        <button id="btnLoopOut" title="Auf dem Hinweg (vom Start zur Wende)">Hinweg</button>
+        <button id="btnLoopBack" title="Auf dem Rückweg (von der Wende zurück)">Rückweg</button>
+      </div>
+      <div class="sub" id="loopHint" style="margin-top:4px"></div>
+    </div>
   </div>
 
   <div class="tile c3">
@@ -472,6 +481,40 @@
     (v.next_zones || []).slice(0, 4).forEach((zn, i) => { const d = document.createElement('div'); d.className = 'zone';
       d.innerHTML = i === 0 ? `<b>${fmt(zn.v)}</b> noch ${fmt(zn.to_km - (p ? p.km : 0), 1)} km` : `<b>${fmt(zn.v)}</b> in ${fmt(zn.in_km, 1)} km · ${fmt(zn.len_km, 1)} km`; z.appendChild(d); });
 
+    // loop picker: only built once per plan, so the dropdown does not
+    // reset under the strategist's finger once a second
+    function renderLoops(st) {
+      const L = st.loops, box = $('loopBox');
+      if (!L || !L.passes.length) { box.style.display = 'none'; return; }
+      box.style.display = 'block';
+      const sel = $('loopNr');
+      const key = L.passes.map(x => x.nr + ':' + x.leg).join('|');
+      if (sel.dataset.key !== key) {
+        sel.dataset.key = key;
+        sel.innerHTML = L.passes.map(x =>
+          `<option value="${x.nr}">${x.leg} (km ${fmt(x.km_start, 1)}–${fmt(x.km_end, 1)})</option>`).join('');
+        sel.value = String((L.current && L.current.nr) || L.passes[0].nr);
+        sel.dataset.lastNr = String((L.current && L.current.nr) || '');
+      }
+      const cur = L.current;
+      // follow the detection while it moves on its own, but never reach
+      // into a dropdown the strategist has just opened to correct it
+      const detNr = cur ? String(cur.nr) : '';
+      if (detNr && detNr !== sel.dataset.lastNr && document.activeElement !== sel) {
+        sel.value = detNr;
+      }
+      sel.dataset.lastNr = detNr;
+      $('loopNow').textContent = cur
+        ? `erkannt: ${cur.leg}, ${cur.half === 'out' ? 'Hinweg' : 'Rückweg'}`
+        : 'erkannt: kein Loop (vor dem Kontrollstopp oder auf dem Weg ins Ziel)';
+      const p0 = L.passes.find(x => String(x.nr) === sel.value);
+      $('btnLoopOut').disabled = !(p0 && p0.has_out);
+      $('btnLoopBack').disabled = !(p0 && p0.has_back);
+      $('loopHint').textContent = p0
+        ? `Wende bei km ${fmt(p0.km_turn, 1)}${p0.stop ? ` · ${p0.stop} bei km ${fmt(p0.km_end, 1)}` : ''}`
+        : '';
+    }
+
     // position
     if (p) {
       $('posKm').textContent = fmt(p.km, 1);
@@ -497,7 +540,8 @@
       cls(el, sm == null ? null : sm > 10 ? 'bad' : sm > 3 ? 'warn' : 'good');
       $('posSrc').textContent = p.source === 'manual' ? 'von Hand gesetzt' : `GPS, ${p.cross_m ?? '?'} m neben der Route`;
       $('manKm').placeholder = fmt(p.km, 1);
-    } else { $('posKm').textContent = '–'; $('posTotal').textContent = ''; $('posLeg').textContent = 'keine Position - GPS abwarten oder km von Hand setzen'; $('posSched').textContent = '–'; $('posSrc').textContent = '–'; }
+      renderLoops(st);
+    } else { $('posKm').textContent = '–'; $('posTotal').textContent = ''; $('posLeg').textContent = 'keine Position - GPS abwarten oder km von Hand setzen'; $('posSched').textContent = '–'; $('posSrc').textContent = '–'; renderLoops(st); }
 
     // next arrival
     const n = st.next;
@@ -543,8 +587,12 @@
     cls(mg, e.margin_wh == null ? null : e.margin_wh < 100 ? 'bad' : e.margin_wh < 300 ? 'warn' : 'good');
     $('eEnd').textContent = e.projected_end_wh == null ? `Plan ${fmt(e.end_wh_plan)} Wh (${fmt(st.plan.end_soc)} %)`
       : `hochgerechnet ${fmt(e.projected_end_wh)} Wh (${fmt(e.projected_end_soc)} %) · Plan ${fmt(e.end_wh_plan)} Wh (${fmt(st.plan.end_soc)} %)`;
-    $('eData').textContent = `${e.n_samples || 0} Samples · ${e.n_gaps || 0} Lücken (${fmt(e.wh_bridged)} Wh überbrückt) · ${e.n_rejected || 0} verworfen`
+    const eD = $('eData');
+    eD.textContent = `${e.n_samples || 0} Samples · ${e.n_gaps || 0} Lücken (${fmt(e.wh_bridged)} Wh überbrückt) · ${e.n_rejected || 0} verworfen`
+      + (e.n_solar_rejected ? ` · ${e.n_solar_rejected} MPPT-Werte unplausibel` : '')
+      + (e.n_breaks ? ` · ${e.n_breaks} Abbruch (${Math.round((e.break_s || 0) / 60)} min NICHT gezählt)` : '')
       + (e.n_anchors ? ` · ${e.n_anchors} Anker` : '') + (e.wh_spilled > 5 ? ` · ${fmt(e.wh_spilled)} Wh bei vollem Pack verworfen` : '');
+    cls(eD, e.n_breaks ? 'bad' : e.n_solar_rejected ? 'warn' : null);
     $('eOrigin').textContent = e.integrated_from
       ? `Ist = ${fmt(e.wh_start)} Wh (Planstart: ${e.wh_start_source || '?'}) + V·I integriert ab ${hhmm(e.integrated_from)}`
       : 'Ist: noch keine Samples integriert';
@@ -652,6 +700,21 @@
     if (!at) { alert('Uhrzeit HH:MM eintragen, oder „Stopp jetzt“ drücken'); return; }
     await post('/api/stop-confirm', { at }); $('stopAt').value = '';
   };
+
+  // --- loop correction: every pass shares its coordinates with every
+  // other, and the outbound half with the return half, so the GPS can
+  // never settle either question on its own. This is the statement that
+  // does — and it hands tracking straight back to the GPS afterwards.
+  const setLoop = async (half) => {
+    const nr = parseInt($('loopNr').value, 10);
+    if (Number.isNaN(nr)) return;
+    const r = await post('/api/loop', { nr, half });
+    if (r && r.far) alert(`Gesetzt auf km ${r.km.toFixed(1)} — aber das GPS `
+      + `liegt ${(r.cross_m / 1000).toFixed(1)} km von diesem Abschnitt weg. `
+      + `Stimmt der gewählte Loop?`);
+  };
+  $('btnLoopOut').onclick = () => setLoop('out');
+  $('btnLoopBack').onclick = () => setLoop('back');
 
   $('simSpeed').onchange = () => post('/api/sim', { speed: parseFloat($('simSpeed').value) });
   $('btnManKm').onclick = () => { const km = parseFloat($('manKm').value); if (Number.isNaN(km)) return; post('/api/position', { km }); };

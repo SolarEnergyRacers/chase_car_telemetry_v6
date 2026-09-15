@@ -144,8 +144,13 @@ class SimSource:
             p_net = (here["p_net_plan"] + here["p_solar_plan"] - p_sol
                      if not standing else -(p_sol - 60.0))
             if standing:
-                # tracked panel charges a bit more than the flat estimate
-                p_sol *= 1.3
+                # tracked panel charges a bit more than the flat estimate -
+                # but only if the plan was built on an aimed panel. With
+                # panel_flat the fake telemetry would otherwise show 30 %
+                # more than the plan predicts at every halt, i.e. exactly
+                # the deviation the live view exists to flag.
+                if not p.meta.get("panel_flat"):
+                    p_sol *= 1.3
                 p_net = -(p_sol - 60.0)
             i = p_net / 115.0 + self._rng.normal(0, 0.3)
             v = terminal_voltage(self.batt, wh, i) + self._rng.normal(0, 0.05)
@@ -495,6 +500,21 @@ def make_handler(server: LiveServer):
                         server.tracker.release_position()
                     server.say("Position wieder aus GPS")
                     self._json({"ok": True})
+                elif path == "/api/loop":
+                    # which pass, and which half of it - the correction for
+                    # a projection that has slipped into the wrong one
+                    half = body.get("half")
+                    half = str(half) if half in ("out", "back") else None
+                    with server.lock:
+                        if server.tracker is None:
+                            raise ValueError("kein Plan geladen")
+                        res = server.tracker.set_loop(int(body["nr"]), half)
+                    server.say(f"Loop {res['nr']}"
+                               + {"out": " Hinweg", "back": " Rueckweg"}.get(half, "")
+                               + f" gesetzt (km {res['km']:.1f})"
+                               + (" - ACHTUNG, GPS liegt weit daneben"
+                                  if res.get("far") else ""))
+                    self._json({"ok": True, **res})
                 elif path == "/api/device":
                     self._json({"ok": True,
                                 "device": server.set_device(body.get("device"))})

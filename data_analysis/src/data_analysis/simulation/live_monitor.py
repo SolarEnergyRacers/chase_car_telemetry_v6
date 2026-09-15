@@ -120,17 +120,20 @@ class TelemetrySigns:
                                  # MPPTs feeding the bus).
                                  # False -> it is the bus/load current and the
                                  # solar has to be subtracted.
-                                 # STILL OPEN for this car. Inferred from the
-                                 # SER-5 standstill data (pack +1.01 A while
-                                 # the array delivered 1.05 A), but that is a
-                                 # wiring property, not a sign convention, and
-                                 # a different car may well route it
-                                 # differently. Costs the whole solar/load
-                                 # split if wrong - a phantom consumption
-                                 # problem exactly the size of the solar
-                                 # input, doubled.
-    net_verified: bool = False   # set True once the standstill test below has
-                                 # been run on THIS car.
+                                 # MEASURED on SER-6 (log of 2026-09-12,
+                                 # 14:55-17:00): 21 rows standing below
+                                 # 3 km/h with the array delivering -
+                                 # batteryCurrent mean +4.06 A against
+                                 # pvCurrent mean +4.37 A, ratio 0.93. The
+                                 # pack current tracks the array current
+                                 # nearly one for one, so the shunt sits in
+                                 # the pack lead and already sees the net;
+                                 # the missing 7 % is the aux draw that
+                                 # never reaches the pack. Costs the whole
+                                 # solar/load split if wrong - a phantom
+                                 # consumption problem exactly the size of
+                                 # the solar input, doubled.
+    net_verified: bool = True    # standstill test run on THIS car, see above.
 
     i_solar_positive: bool = True # solar current > 0 = generating
 
@@ -145,6 +148,40 @@ class TelemetrySigns:
     v_min: float = 70.0
     v_max: float = 135.0
     i_abs_max: float = 120.0
+
+    # The same gate for the solar side, PER MPPT CHANNEL. It was missing
+    # for a while and that is exactly how a single 1.1e31 W sample out of
+    # the MPPT frame turned the day's solar into 6.1e27 Wh and the
+    # projection into a meaningless number: v_pack and i_batt were gated,
+    # p_solar was not, and nothing downstream re-anchors an integral.
+    # The array is roughly 1.2 kW across four MPPTs, so 600 W on one
+    # channel is already twice what any channel can deliver - anything
+    # above that is a broken frame, not a good day.
+    p_mppt_max: float = 600.0
+    # A negative channel is a converter sinking, physically small; a
+    # deeply negative one is garbage. Same argument, other direction.
+    p_mppt_min: float = -100.0
+    n_mppt: int = 4              # only used to scale the gate when the
+                                 # telemetry hands over one total instead
+                                 # of one value per channel.
+
+    def solar_gate(self, p_chan):
+        """Drop implausible MPPT channels. Returns (total_W, n_dropped).
+
+        A bad channel is zeroed, not made to poison the sample: the
+        battery side of this sample is still a valid measurement, and with
+        i_batt_is_net the solar value does not enter the pack integral at
+        all - only the solar/load split. Losing one channel for one second
+        is a rounding error; keeping 1e31 is not.
+        """
+        p = np.atleast_1d(np.asarray(p_chan, dtype=float))
+        hi = self.p_mppt_max * (self.n_mppt if p.size == 1 else 1)
+        lo = self.p_mppt_min * (self.n_mppt if p.size == 1 else 1)
+        ok = np.isfinite(p) & (p >= lo) & (p <= hi)
+        # a NaN channel counts as zero, not as a rejection: three live
+        # MPPTs and one dead one is still a measurement.
+        bad = int(np.count_nonzero(~ok & ~np.isnan(p)))
+        return max(0.0, float(np.sum(np.where(ok, p, 0.0)))), bad
 
     def batt_power(self, v: float, i_batt: float, p_solar: float = 0.0):
         """Net battery power in W, POSITIVE = drawn from the pack."""
@@ -242,6 +279,7 @@ class LiveEnergy:
         plan: DayPlan = None,
         signs: TelemetrySigns = None,
         max_gap_s: float = 30.0,
+        max_bridge_s: float = 1800.0,
     ):
         """
         Args:
@@ -252,11 +290,18 @@ class LiveEnergy:
                 separately and reported in `status()["wh_bridged"]`. A
                 dropout while climbing is where an energy count silently
                 goes wrong, so it must be visible rather than smoothed over.
+            max_bridge_s: the point where bridging stops being a bridge.
+                Samples further apart than this are NOT integrated at all -
+                the trapezoid between two edges an hour apart says nothing
+                about what happened in between, and integrating it lets a
+                single clock jump invent more energy than the pack holds.
+                The stretch is then missing from the count; re-anchor.
         """
         self.batt = batt
         self.plan = plan
         self.signs = signs or TelemetrySigns()
         self.max_gap_s = max_gap_s
+        self.max_bridge_s = max(float(max_bridge_s), float(max_gap_s))
         if not self.signs.sign_verified:
             lg.warning(
                 "battery current sign unverified (discharge_positive=%s). "
@@ -276,9 +321,12 @@ class LiveEnergy:
         self.wh_bridged = 0.0       # share of wh_used across gaps
         self.wh_spilled = 0.0       # integrated past a full pack, discarded
         self.n_gaps = 0
+        self.n_breaks = 0           # gaps too long to bridge, see above
+        self.break_s = 0.0          # total time NOT covered by the integral
         self.n_mppt_dropouts = 0
         self.n_v_solar_odd = 0
         self.n_rejected = 0
+        self.n_solar_rejected = 0   # implausible MPPT channels dropped
         self._t_last = None
         self._p_last = None
         self._p_solar_last = 0.0
@@ -343,11 +391,9 @@ class LiveEnergy:
         p_sol = 0.0
         i_chan = None
         if p_solar is not None:
-            # per-channel list or scalar; a NaN channel counts as zero,
-            # not as "no solar data" - three live MPPTs and one dead one
-            # is still a measurement. (np.isfinite() on a list raised.)
-            p_arr = np.atleast_1d(np.asarray(p_solar, dtype=float))
-            p_sol = max(0.0, float(np.nansum(p_arr)))
+            # per-channel list or scalar, gated channel by channel
+            p_sol, bad = self.signs.solar_gate(p_solar)
+            self._count_solar_rejects(t, bad, p_solar)
         elif i_solar is not None:
             sgn = 1.0 if self.signs.i_solar_positive else -1.0
             i_chan = sgn * np.atleast_1d(np.asarray(i_solar, dtype=float))
@@ -362,8 +408,8 @@ class LiveEnergy:
                         f"v_solar has {v_chan.size} values for "
                         f"{i_chan.size} solar currents - pass one per "
                         "channel or a single scalar")
-            p_chan = np.where(np.isfinite(i_chan * v_chan), i_chan * v_chan, 0.0)
-            p_sol = max(0.0, float(np.sum(p_chan)))
+            p_sol, bad = self.signs.solar_gate(i_chan * v_chan)
+            self._count_solar_rejects(t, bad, i_chan * v_chan)
             self._check_mppt_channels(t, i_chan)
             if v_solar is not None:
                 self._check_mppt_voltages(t, v_chan, v_pack)
@@ -374,6 +420,24 @@ class LiveEnergy:
             dt_s = (t - self._t_last).total_seconds()
             if dt_s <= 0:
                 self.n_rejected += 1        # out of order / duplicate
+                return self.status()
+            if dt_s > self.max_bridge_s:
+                # Beyond this, a trapezoid between the two edges of the
+                # hole is not a bridge, it is an invention: the same code
+                # path that quietly turns a log spanning June to September
+                # into a megawatt-hour of phantom consumption. The honest
+                # answer for the missing stretch is "unknown", so nothing
+                # is integrated and the break is made loud. Re-anchor with
+                # anchor_from_measurement() at the next standstill.
+                self.n_breaks += 1
+                self.break_s += dt_s
+                lg.error("telemetry break of %.0f s at %s - NOT integrated, "
+                         "the energy count now misses this stretch "
+                         "(break #%d)", dt_s, t, self.n_breaks)
+                self._t_last, self._p_last = t, p_batt
+                self._p_solar_last = p_solar
+                self._append_row(t, odo_km, v_pack, i_batt, p_batt,
+                                 p_solar, i_chan)
                 return self.status()
             dt_h = dt_s / 3600.0
             dwh = 0.5 * (self._p_last + p_batt) * dt_h
@@ -401,7 +465,11 @@ class LiveEnergy:
 
         self._t_last, self._p_last = t, p_batt
         self._p_solar_last = p_solar
+        self._append_row(t, odo_km, v_pack, i_batt, p_batt, p_solar, i_chan)
+        return self.status()
 
+    def _append_row(self, t, odo_km, v_pack, i_batt, p_batt, p_solar,
+                    i_chan) -> None:
         row_chan = ({f"i_mppt{k+1}": float(v) for k, v in enumerate(i_chan)}
                     if i_chan is not None and i_chan.size > 1 else {})
         self._rows.append({
@@ -411,7 +479,15 @@ class LiveEnergy:
             "wh_used": self.wh_used, "wh_solar": self.wh_solar,
             "wh_remaining": self.wh_start - self.wh_used,
         })
-        return self.status()
+
+    def _count_solar_rejects(self, t, bad: int, raw) -> None:
+        if not bad:
+            return
+        self.n_solar_rejected += bad
+        if self.n_solar_rejected <= 5 or self.n_solar_rejected % 50 == 0:
+            lg.warning("implausible MPPT reading at %s: %s W - channel "
+                       "dropped (#%d)", t, np.atleast_1d(raw).tolist(),
+                       self.n_solar_rejected)
 
     def _check_mppt_channels(self, t, i_chan) -> None:
         """Flag a channel that has gone dead while the others deliver.
@@ -561,9 +637,12 @@ class LiveEnergy:
             "wh_bridged":    round(self.wh_bridged, 1),
             "wh_spilled":    round(self.wh_spilled, 1),
             "n_gaps":        self.n_gaps,
+            "n_breaks":      self.n_breaks,
+            "break_s":       round(self.break_s, 1),
             "n_mppt_dropouts": self.n_mppt_dropouts,
             "n_v_solar_odd":   self.n_v_solar_odd,
             "n_rejected":    self.n_rejected,
+            "n_solar_rejected": self.n_solar_rejected,
             "v_pack_pred":   round(terminal_voltage(self.batt, wh_rem), 2),
             "odo_km":        None,
             "delta_wh":      None,

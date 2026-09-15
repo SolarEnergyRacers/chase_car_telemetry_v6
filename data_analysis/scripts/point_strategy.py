@@ -5,6 +5,9 @@
         --soc 62 --time 12:40                           # nothing asked
     python scripts/point_strategy.py --plan 2            # plan mode, 2 loops
     python scripts/point_strategy.py --plan 2 --stop 45:20   # +20 min at km 45
+    python scripts/point_strategy.py --plan 2 --flat-panel   # panel not aimed
+    python scripts/point_strategy.py --plan 2 --flat-panel --stop 45:40:aus
+                                                # ... but aimed at that halt
 
 Three inputs can each come from a measurement or from the keyboard, and the
 script asks per input rather than per mode - at a control stop the pack may
@@ -24,6 +27,7 @@ day's plan.
 from   datetime import date, datetime, timedelta
 import argparse
 import logging as lg
+import os
 import sys
 
 import numpy as np
@@ -334,6 +338,19 @@ def parts_needed(part: str) -> tuple:
     }[part]
 
 
+def _morning_tracked(args) -> bool:
+    """Is the panel aimed in tomorrow's morning window?
+
+    --flat-panel is a statement about the CAR, so by default it covers the
+    overnight stop as well. Deliberately the conservative direction: an
+    overstated `offered` LOWERS wh_max_arrival and would advise arriving
+    emptier than the morning can refill. --aim-morning takes it back for
+    the case where the panel can be propped up by hand overnight, which is
+    a different job from aiming it in a five-minute loop break.
+    """
+    return (not args.flat_panel) or args.aim_morning
+
+
 def overnight_point(routes: dict):
     """Where the car spends the night: the last node of the day's route.
 
@@ -351,7 +368,7 @@ def overnight_point(routes: dict):
 
 
 def load_morning(day: int, rc, routes: dict, spacing_km: float, car, batt,
-                 wh_end):
+                 wh_end, tracked: bool = True):
     """The next morning's charge window at the overnight stop.
 
     Location from TODAY's route end; weather for TOMORROW's date at that
@@ -413,7 +430,8 @@ def load_morning(day: int, rc, routes: dict, spacing_km: float, car, batt,
 
     try:
         return dayplan.morning_charge(weather, here[0], here[1], release,
-                                      t_start_next, car, batt, wh_end), why
+                                      t_start_next, car, batt, wh_end,
+                                      tracked=tracked), why
     except Exception as e:
         return None, f"nicht berechenbar ({type(e).__name__}: {str(e)[:70]})"
 
@@ -435,6 +453,58 @@ def load_weathers(day: int, day_date, which: tuple, spacing_km: float):
 
 
 # --------------------------------------------------------------------- main ----
+
+_AIM_WORDS  = {"aus", "ausgerichtet", "ausrichten", "aim", "aimed",
+               "tracked", "track", "gti"}
+_FLAT_WORDS = {"flach", "flat", "eben", "ghi", "none", "nein"}
+
+
+def _parse_panel_mode(word: str, what: str):
+    """PANEL field of --stop / --sweep-stop -> (aim, tracked_min).
+
+    Three answers, not two: aim, flat, or a number of minutes. The number
+    is there because a long charging halt is often only half supervised -
+    the panel gets aimed while the crew is out anyway and goes flat again
+    before the restart, and rounding that to "the whole halt" overstates a
+    45-minute stop by more than the stop is worth.
+
+    Returns (None, None) for an empty field, meaning: follow the day.
+    """
+    w = (word or "").strip().lower()
+    if not w:
+        return None, None
+    if w in _AIM_WORDS:
+        return True, None
+    if w in _FLAT_WORDS:
+        return False, None
+    try:
+        minutes = float(w)
+    except ValueError:
+        raise SystemExit(
+            f"{what}: PANEL erwartet 'aus', 'flach' oder Minuten, "
+            f"bekommen {word!r}")
+    if minutes < 0:
+        raise SystemExit(f"{what}: PANEL-Minuten duerfen nicht negativ sein")
+    # 0 aimed minutes is flat, and saying it that way keeps the plan's leg
+    # name honest instead of printing "(0 min ausgerichtet)"
+    if minutes == 0:
+        return False, None
+    return True, minutes
+
+
+def _env_flat_panel() -> bool:
+    """Default for --flat-panel from SSC_FLAT_PANEL.
+
+    A blocked panel is a state of the car that lasts days, not a per-run
+    choice, and a flag that has to be remembered on every one of a dozen
+    runs a day will be forgotten on the run that matters. Safe to have as
+    an environment default only because the header PRINTS the panel state:
+    the premise is visible in the output either way, so nobody can end up
+    reading a flat-panel plan as a tracked one.
+    """
+    return os.environ.get("SSC_FLAT_PANEL", "").strip().lower() in (
+        "1", "true", "yes", "ja", "on")
+
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
@@ -461,16 +531,42 @@ def parse_args(argv=None):
     g = p.add_argument_group("Zeit")
     g.add_argument("--time", help="'now', 'HH:MM' oder ISO-Zeitstempel")
 
+    g = p.add_argument_group("Panel")
+    # BooleanOptionalAction adds --no-flat-panel by itself, so that a
+    # SSC_FLAT_PANEL default can be taken back for a single run
+    g.add_argument("--flat-panel",
+                   action=argparse.BooleanOptionalAction,
+                   default=_env_flat_panel(), dest="flat_panel",
+                   help="das Panel wird NICHT ausgerichtet und bleibt flach "
+                        "liegen (mechanisch blockiert). Gilt fuer jeden Halt "
+                        "- Kontrollstopp, Loopstopps, --stop, Restzeit vor "
+                        "der Ziellinie - und fuer das Morgenfenster. Die "
+                        "Standzeiten bleiben gleich lang, sie laden nur mit "
+                        "GHI statt mit nachgefuehrtem GTI. Dauerhaft ueber "
+                        "SSC_FLAT_PANEL=1 setzbar, einzelner Lauf dann mit "
+                        "--no-flat-panel zurueck")
+    g.add_argument("--aim-morning", action="store_true", dest="aim_morning",
+                   help="nur mit --flat-panel: im Morgenfenster am "
+                        "Nachtquartier wird das Panel doch ausgerichtet "
+                        "(z. B. von Hand aufgebockt). Tagsueber bleibt es "
+                        "flach")
+
     g = p.add_argument_group("Modus")
     g.add_argument("--plan", type=int, metavar="N",
                    help="Fahrplan fuer N verbleibende Loops statt der "
                         "Optionstabelle")
-    g.add_argument("--stop", action="append", default=[], metavar="KM:MIN",
+    g.add_argument("--stop", action="append", default=[],
+                   metavar="KM:MIN[:PANEL]",
                    help="Standladen: km ab hier und Dauer in Minuten, "
                         "mehrfach erlaubt. Negative km zaehlen vom Ziel "
                         "zurueck, dann mit Gleichheitszeichen schreiben: "
                         "--stop=-5:30 sind 30 min ab 5 km vor dem Ziel "
-                        "(ohne = haelt argparse das Minus fuer eine Option)")
+                        "(ohne = haelt argparse das Minus fuer eine Option). "
+                        "PANEL ist optional und gilt nur fuer diesen Halt: "
+                        "'aus' bzw. 'ausgerichtet' richtet aus (auch mit "
+                        "--flat-panel), 'flach' laesst flach (auch ohne), "
+                        "eine Zahl richtet so viele Minuten des Halts aus. "
+                        "Ohne Angabe gilt die Einstellung des Tages")
     g.add_argument("--driver-change", action="append", default=[],
                    dest="driver_change", metavar="KM|@HH:MM",
                    help="Fahrerwechsel erzwingen, bei km oder zu einer "
@@ -478,12 +574,15 @@ def parse_args(argv=None):
     g.add_argument("--no-auto-driver-change", action="store_true",
                    dest="no_auto_dc",
                    help="die automatischen Wechsel alle 2 h weglassen")
-    g.add_argument("--sweep-stop", type=float, dest="sweep_stop",
-                   metavar="KM",
+    g.add_argument("--sweep-stop", dest="sweep_stop",
+                   metavar="KM[:PANEL]",
                    help="Standladen an dieser Stelle in 15-min-Schritten "
                         "durchrechnen und die Ausbeute vergleichen. "
                         "Negative km zaehlen vom Ziel zurueck, dann mit "
-                        "Gleichheitszeichen: --sweep-stop=-1")
+                        "Gleichheitszeichen: --sweep-stop=-1. PANEL wie bei "
+                        "--stop, also z. B. --sweep-stop=-1:aus, um auf "
+                        "einem flachen Tag die ausgerichtete Variante zu "
+                        "pruefen")
     g.add_argument("--n-max", type=int, default=10, dest="n_max",
                    help="wie viele Loop-Zahlen die Optionstabelle "
                         "durchrechnet. Sie bricht ohnehin eine Zeile nach "
@@ -562,16 +661,30 @@ def main(argv=None) -> int:
         loop_leg=leg, loop_done=loops_done, position_source=pos_src,
         cross_track_m=cross, notes=notes)
 
-    # --stop KM:MIN, where a negative KM counts back from the end of the
-    # day. rsplit, because "-5:30" has the minus in front of the km.
+    # --stop KM:MIN[:PANEL], where a negative KM counts back from the end
+    # of the day. Split from the LEFT after peeling the optional PANEL off
+    # the right: "-5:30" has the minus in front of the km, and "-5:30:aus"
+    # must not turn into km "-5" / min "30:aus".
     extra_stops = []
     for s in args.stop:
+        f = s.split(":")
+        if len(f) not in (2, 3):
+            raise SystemExit(f"--stop erwartet KM:MIN[:PANEL], "
+                             f"bekommen {s!r}")
         try:
-            a, b = s.rsplit(":", 1)
-            extra_stops.append(dayplan.StopSpec(km=float(a),
-                                                minutes=float(b)))
+            km, minutes = float(f[0]), float(f[1])
         except ValueError:
-            raise SystemExit(f"--stop erwartet KM:MIN, bekommen {s!r}")
+            raise SystemExit(f"--stop erwartet KM:MIN[:PANEL], "
+                             f"bekommen {s!r}")
+        aim, tracked_min = _parse_panel_mode(
+            f[2] if len(f) == 3 else "", f"--stop {s!r}")
+        if tracked_min is not None and tracked_min > minutes:
+            log.warning("--stop %s: %.0f ausgerichtete Minuten sind mehr "
+                        "als der Halt lang ist - auf %.0f gekuerzt",
+                        s, tracked_min, minutes)
+        extra_stops.append(dayplan.StopSpec(km=km, minutes=minutes,
+                                            aim=aim,
+                                            tracked_min=tracked_min))
 
     forced_dc = []
     for s in args.driver_change:
@@ -591,13 +704,46 @@ def main(argv=None) -> int:
             raise SystemExit(f"--driver-change erwartet km oder @HH:MM, "
                              f"bekommen {s!r}")
 
+    # --sweep-stop KM[:PANEL]. Parsed here and not by argparse's type=,
+    # because the km has to stay a float for report.sweep_text() while the
+    # panel choice goes to a different place entirely.
+    sweep_km, sweep_aim = None, None
+    if args.sweep_stop is not None:
+        f = str(args.sweep_stop).split(":")
+        if len(f) not in (1, 2):
+            raise SystemExit(f"--sweep-stop erwartet KM[:PANEL], bekommen "
+                             f"{args.sweep_stop!r}")
+        try:
+            sweep_km = float(f[0])
+        except ValueError:
+            raise SystemExit(f"--sweep-stop erwartet KM[:PANEL], bekommen "
+                             f"{args.sweep_stop!r}")
+        sweep_aim, sweep_tracked = _parse_panel_mode(
+            f[1] if len(f) == 2 else "", "--sweep-stop")
+        if sweep_tracked is not None:
+            # A fixed number of aimed minutes against a varying halt length
+            # is two knobs fighting: at 15 min of halt it would be the whole
+            # thing, at 120 an eighth, and the curve would say nothing about
+            # either. Refuse rather than silently pick one reading.
+            raise SystemExit("--sweep-stop: PANEL als Minutenzahl ergibt "
+                             "hier keinen Sinn, weil die Haltedauer selbst "
+                             "variiert wird - 'aus' oder 'flach' nehmen")
+
+    if args.aim_morning and not args.flat_panel:
+        log.warning("--aim-morning ohne --flat-panel ist ohne Wirkung - "
+                    "das Morgenfenster wird ohnehin ausgerichtet gerechnet")
+
+    # one dict for every evaluate()/options()/sweep_stop() call below, so a
+    # flag cannot reach the options table but miss the plan mode
     ev = dict(extra_stops=extra_stops, driver_changes=forced_dc,
-              auto_driver_change=not args.no_auto_dc)
+              auto_driver_change=not args.no_auto_dc,
+              panel_flat=args.flat_panel)
 
     print()
     print(f"=== Tag {day}, {day_date:%d.%m.%Y}, Fenster "
           f"{t_start:%H:%M}-{t_deadline:%H:%M} SAST ===")
-    print(report.header(state, weathers))
+    print(report.header(state, weathers, panel_flat=args.flat_panel,
+                        aim_morning=args.aim_morning))
 
     plotted = None
     to_save = []        # (DayOption, mode) pairs written as plan files
@@ -617,15 +763,18 @@ def main(argv=None) -> int:
             print(f"\nkeine --plan angegeben, gesweept wird die beste "
                   f"machbare Option: {n} Loop(s)")
         rows = dayplan.sweep_stop(state, parts, n, car, batt,
-                                  args.sweep_stop, **ev)
+                                  sweep_km, aim=sweep_aim, **ev)
         ceiling = None
         first_ok = next((o for _, o in rows if o.feasible), None)
         if first_ok is not None:
             mc, _ = load_morning(day, rc, routes, args.spacing_km, car,
-                                 batt, first_ok.end_wh)
+                                 batt, first_ok.end_wh,
+                                 tracked=_morning_tracked(args))
             if mc is not None:
                 ceiling = mc.wh_max_arrival
-        print(report.sweep_text(rows, batt, args.sweep_stop, ceiling))
+        print(report.sweep_text(rows, batt, sweep_km, ceiling,
+                                aim=sweep_aim,
+                                panel_flat=args.flat_panel))
         return 0
 
     if part == "to_finish" and args.plan is None:
@@ -688,13 +837,18 @@ def main(argv=None) -> int:
     mc = None
     if plotted is not None and plotted.feasible:
         mc, why = load_morning(day, rc, routes, args.spacing_km, car, batt,
-                               plotted.end_wh)
+                               plotted.end_wh,
+                               tracked=_morning_tracked(args))
         if mc is None:
             print(f"\nKein Morgenfenster fuer Tag {day+1}: {why}")
         else:
             if why:
                 print(f"\nHinweis  {why}")
-            print(f"\nMorgenfenster Tag {day+1}: angeboten "
+            # The panel state is named here and not only in the header: the
+            # morning window is the one number where flat against tracked
+            # can differ by a factor of two, because the sun is low.
+            print(f"\nMorgenfenster Tag {day+1} "
+                  f"({'ausgerichtet' if mc.tracked else 'flach'}): angeboten "
                   f"{mc.offered:.0f} Wh, aufgenommen {mc.absorbed:.0f} Wh"
                   + (f", verworfen {mc.spilled:.0f} Wh"
                      if mc.spilled > 1 else "")

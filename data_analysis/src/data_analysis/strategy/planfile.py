@@ -76,6 +76,29 @@ def default_plans_dir() -> Path:
     return Path(__file__).resolve().parents[3] / "plans"
 
 
+def _utc(t):
+    """ISO strings -> UTC timestamps, mixed precision and all.
+
+    `Timestamp.isoformat()` drops the fractional part when it is zero, so
+    a column written by _iso() is a MIXTURE: most rows carry nanoseconds,
+    a row that happens to land on a whole second does not. pandas infers
+    one format from the first element and then applies it strictly, so
+    such a column raises
+
+        time data "2026-09-13T15:00:00+00:00" doesn't match format
+        "%Y-%m-%dT%H:%M:%S.%f%z"
+
+    and the plan does not load at all. The whole second is not exotic: the
+    last leg is clamped to the race deadline, which is a round time, so
+    every plan that uses up the day ends on one.
+
+    `format="ISO8601"` is exactly this case - one grammar, per-value
+    precision. Not "mixed", which re-sniffs every element and would also
+    swallow things that are not ISO at all.
+    """
+    return pd.to_datetime(t, utc=True, format="ISO8601")
+
+
 def _secs(t) -> np.ndarray:
     """Timestamps -> Unix seconds, independent of the datetime64 unit.
 
@@ -83,7 +106,7 @@ def _secs(t) -> np.ndarray:
     pandas 2 happily builds microsecond ones from ISO strings, and then
     every lookup is off by a factor of a thousand without a single error.
     """
-    idx = pd.DatetimeIndex(pd.to_datetime(t, utc=True))
+    idx = pd.DatetimeIndex(_utc(t))
     return ((idx.tz_convert("UTC").tz_localize(None)
              - pd.Timestamp("1970-01-01")) / pd.Timedelta(seconds=1)).to_numpy()
 
@@ -104,11 +127,11 @@ def _trace_for_file(tr: pd.DataFrame) -> pd.DataFrame:
     nobody downstream has to know that.
     """
     tr = tr.reset_index(drop=True).copy()
-    t = pd.to_datetime(tr["time"], utc=True)
+    t = _utc(tr["time"])
     dt = pd.to_timedelta(tr["dt_s"].to_numpy(), unit="s")
     is_drive = tr["kind"].to_numpy() == "drive"
     t_start = pd.Series(np.where(is_drive, t - dt / 2, t), index=tr.index)
-    t_start = pd.to_datetime(t_start, utc=True)
+    t_start = _utc(t_start)
     tr["t_start"] = t_start
     tr["t_end"] = t_start + dt
     km_end = tr["km_total"].to_numpy(dtype=float)
@@ -173,6 +196,11 @@ def save_plan(opt, state, batt, weathers: dict = None, out_dir: Path = None,
         "cloud_margin": opt.cloud_margin,
         "wh_spilled": float(opt.wh_spilled),
         "floor_released": bool(opt.floor_released),
+        # panel never aimed: every halt in the trace charges at GHI. The
+        # live view has to know, because its own standing estimate would
+        # otherwise add a tracked bonus the car cannot earn. Older files
+        # have no such key, so every reader must default to False.
+        "panel_flat": bool(getattr(opt, "panel_flat", False)),
         "driver_changes_km": [float(s.km) for s in opt.driver_changes],
         # the regulated minimum per halt kind, from race_config.json - the
         # live view shows from when driving on is ALLOWED, which is not the
@@ -200,9 +228,14 @@ def save_plan(opt, state, batt, weathers: dict = None, out_dir: Path = None,
     rows = rows.astype(object).where(pd.notna(rows), None)
 
     t_local = pd.Timestamp(state.t_now).tz_convert("Africa/Johannesburg")
+    # "flach" in the name, so that two runs differing ONLY in the panel
+    # premise are still tellable apart in a directory listing - the label
+    # in the menu says it too, but the file name is what gets copied
+    # around and quoted in a debrief
     stem = (f"tag{state.day}_{t_local:%H%M}_{state.part}_"
-            f"km{state.km_in_part:.0f}_{opt.n_loops}loops_"
-            f"{created:%Y%m%dT%H%M%S}")
+            f"km{state.km_in_part:.0f}_{opt.n_loops}loops"
+            + ("_flach" if meta["panel_flat"] else "")
+            + f"_{created:%Y%m%dT%H%M%S}")
     path = out_dir / f"{stem}.json"
     with path.open("w", encoding="utf-8") as f:
         json.dump({"meta": meta, "columns": TRACE_COLS,
@@ -219,6 +252,8 @@ def plan_label(meta: dict) -> str:
     s = (f"Tag {meta['day']} · {t:%H:%M} {part_de.get(meta['part'], meta['part'])} "
          f"km {meta['km_in_part']:.0f} · {meta['n_loops']} Loops · "
          f"{meta['km']:.0f} km · Ende {100*meta['end_soc']:.0f} %")
+    if meta.get("panel_flat"):
+        s += " · Panel flach"
     if meta.get("mode") == "plan":
         s += " · --plan"
     return s
@@ -278,6 +313,7 @@ class Plan:
         self._poly_lat = d["lat"].to_numpy(dtype=float)
         self._poly_lon = d["lon"].to_numpy(dtype=float)
         self._poly_km = d["km_start"].to_numpy(dtype=float)
+        self._loop_cache = None
         # cumulative planned solar and load, Wh, at km_end - what
         # live_monitor.DayPlan builds too, kept here so a Plan can stand in
         self.dt_h = tr["dt_s"].to_numpy(dtype=float) / 3600.0
@@ -298,7 +334,7 @@ class Plan:
                         path.name, d["meta"]["format"], FORMAT_VERSION)
         tr = pd.DataFrame(d["rows"], columns=d["columns"])
         for col in ("t_start", "t_end"):
-            tr[col] = pd.to_datetime(tr[col], utc=True)
+            tr[col] = _utc(tr[col])
         num = [c for c in TRACE_COLS if c not in
                ("t_start", "t_end", "leg", "kind", "panel")]
         for c in num:
@@ -337,11 +373,11 @@ class Plan:
 
     @property
     def t_start(self) -> pd.Timestamp:
-        return pd.to_datetime(self.tr["t_start"].iloc[0], utc=True)
+        return _utc(self.tr["t_start"].iloc[0])
 
     @property
     def t_finish(self) -> pd.Timestamp:
-        return pd.to_datetime(self.tr["t_end"].iloc[-1], utc=True)
+        return _utc(self.tr["t_end"].iloc[-1])
 
     @property
     def wh_start(self) -> float:
@@ -394,6 +430,93 @@ class Plan:
                         "t_end": pd.Timestamp(g["t_end"].iloc[-1])})
         return out
 
+    def loop_passes(self) -> list:
+        """Every pass of the loop, with its turnaround.
+
+        A loop is driven out and back over the same road - inputs.py
+        builds it as the outbound route followed by itself reversed, with
+        the turnaround node dropped - so the two halves share every
+        coordinate. A GPS fix alone therefore cannot say which half the
+        car is on, nor which pass; only the km axis can, because it is the
+        unrolled day. That is precisely why a wrong pass has to be
+        correctable by hand: the projection resolves the ambiguity from
+        the PREVIOUS fix, so once it has slipped, it stays slipped, and
+        every ETA and the whole energy comparison slip with it.
+
+        The turnaround is read off the coordinates rather than assumed to
+        be the midpoint: the first loop of a plan computed mid-loop is a
+        remainder ("Loop (laufend, Rest)") and may be all return leg. It
+        is the node farthest from the leg's start - which for a full loop
+        IS the midpoint, and for a remainder is wherever the turn still
+        lies ahead, or the start itself if it is already behind.
+
+        Returns, per pass: nr (1-based), leg (the label), km_start,
+        km_turn, km_end, out_km/back_km, and the loop stop that closes it.
+        """
+        if getattr(self, "_loop_cache", None) is not None:
+            return self._loop_cache          # called once a second, per fix
+        stops = self.stops()
+        loop_stops = stops[stops["kind"] == "loop"] if not stops.empty else stops
+        out = []
+        for lg in self.legs():
+            if not str(lg["leg"]).lower().startswith("loop"):
+                continue
+            a, b = lg["km_start"], lg["km_end"]
+            sel = (self._poly_km >= a - 1e-9) & (self._poly_km <= b + 1e-9)
+            km_turn = 0.5 * (a + b)          # fallback: no coordinates
+            if sel.sum() >= 2:
+                lat, lon = self._poly_lat[sel], self._poly_lon[sel]
+                km = self._poly_km[sel]
+                good = np.isfinite(lat) & np.isfinite(lon)
+                if good.sum() >= 2:
+                    lat, lon, km = lat[good], lon[good], km[good]
+                    # planar is plenty over a loop of a few tens of km
+                    phi = np.radians(lat[0])
+                    dx = (lon - lon[0]) * 111_412.84 * np.cos(phi)
+                    dy = (lat - lat[0]) * 111_132.92
+                    km_turn = float(km[int(np.argmax(np.hypot(dx, dy)))])
+            nr = len(out) + 1
+            stop_name, stop_km = None, None
+            if not loop_stops.empty:
+                d = (loop_stops["km"] - b).abs()
+                if float(d.min()) <= 0.3:
+                    r = loop_stops.loc[d.idxmin()]
+                    stop_name, stop_km = str(r["name"]), float(r["km"])
+            out.append({"nr": nr, "leg": str(lg["leg"]),
+                        "km_start": float(a), "km_turn": float(km_turn),
+                        "km_end": float(b),
+                        "out_km": float(km_turn - a),
+                        "back_km": float(b - km_turn),
+                        "stop": stop_name, "stop_km": stop_km,
+                        "t_start": lg["t_start"], "t_end": lg["t_end"]})
+        self._loop_cache = out
+        return out
+
+    def loop_at_km(self, km: float) -> dict:
+        """Which loop pass and half a kilometre falls in, or None.
+
+        `half` is 'out' or 'back'; a remainder leg with no outbound part
+        left reports 'back' throughout, which is what it is.
+        """
+        if km is None:
+            return None
+        for p in self.loop_passes():
+            if p["km_start"] - 1e-9 <= km <= p["km_end"] + 1e-9:
+                half = "out" if (p["out_km"] > 0 and km <= p["km_turn"]) else "back"
+                return {**p, "half": half}
+        return None
+
+    def loop_window(self, nr: int, half: str = None) -> tuple:
+        """(km_lo, km_hi) of one pass, or of one half of it."""
+        p = next((x for x in self.loop_passes() if x["nr"] == int(nr)), None)
+        if p is None:
+            raise ValueError(f"Loop {nr} gibt es in diesem Plan nicht")
+        if half == "out" and p["out_km"] > 0:
+            return p["km_start"], p["km_turn"]
+        if half == "back" and p["back_km"] > 0:
+            return p["km_turn"], p["km_end"]
+        return p["km_start"], p["km_end"]
+
     def wh_at_km(self, km: float) -> dict:
         """Planned pack state and cumulatives at km (interpolated)."""
         km = float(np.clip(km, 0.0, self._km_end[-1]))
@@ -444,13 +567,20 @@ class Plan:
                 standing: bool = False):
         """The planned standing phase the car is in, if any.
 
-        A halt counts from two minutes before its planned arrival (the car
-        may be early) to its planned departure. `standing=True` drops the
-        upper bound: a car that stands at the control stop after arriving
-        twenty minutes late is still at the control stop, and without this
-        the whole display fell back to "driving" exactly when it was most
-        obviously not. The caller knows whether the car stands; the plan
-        does not.
+        While DRIVING, a halt counts from two minutes before its planned
+        arrival (the car may be early) to its planned departure.
+
+        `standing=True` drops BOTH bounds, because a car that stands at a
+        halt's kilometre is at that halt whatever the clock says. The
+        upper bound went first: twenty minutes late at the control stop
+        and the whole display fell back to "driving" exactly when it was
+        most obviously not. The lower bound is the same mistake mirrored,
+        and it bites hardest on loops - a loop stop is five minutes long,
+        so arriving three minutes early is normal rather than remarkable.
+        Measured on the loop plan: six minutes early at Loopstopp 1 and
+        `at_stop` was None - no halt box, no "leave at", and a confirmed
+        arrival could not even be attributed to a halt. The caller knows
+        whether the car stands; the plan does not.
 
         Returns the stops() row or None. The nearest halt wins when two
         are within tolerance, which only happens on a loop shorter than
@@ -465,10 +595,11 @@ class Plan:
             d = abs(float(r["km"]) - km)
             if d > tol_km or d >= best_d:
                 continue
-            if t < r["t_arrive"] - pd.Timedelta(minutes=2):
-                continue
-            if not standing and t > r["t_depart"]:
-                continue
+            if not standing:
+                if t < r["t_arrive"] - pd.Timedelta(minutes=2):
+                    continue
+                if t > r["t_depart"]:
+                    continue
             best, best_d = r, d
         return best
 
@@ -724,7 +855,7 @@ class Plan:
         """A live_monitor.DayPlan over this trace, for LiveEnergy."""
         from ..simulation.live_monitor import DayPlan
         df = pd.DataFrame({
-            "time": pd.to_datetime(self.tr["t_start"], utc=True),
+            "time": _utc(self.tr["t_start"]),
             "cum_km": self._km_end,
             "wh_remaining": self.tr["wh_remaining"].to_numpy(dtype=float),
             "dt_s": self.tr["dt_s"].to_numpy(dtype=float),

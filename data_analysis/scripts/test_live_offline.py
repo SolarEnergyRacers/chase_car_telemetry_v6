@@ -36,18 +36,27 @@ def check(name, cond, detail=""):
         FAILS.append(name)
 
 
-def synthetic_plan(batt) -> planfile.Plan:
+def synthetic_plan(batt, n_loops: int = 1,
+                   loop_stops: bool = False) -> planfile.Plan:
     """30 km due north at 60 km/h, a 10-min stop at km 10, a loop-like
-    out-and-back over km 20..30 so the same road appears twice."""
+    out-and-back over km 20..30 so the same road appears twice.
+
+    `n_loops` repeats that out-and-back, `loop_stops` puts a Loopstopp at
+    the end of each pass - the shape a real day has, where every pass
+    shares every coordinate with every other and the projection is the
+    only thing that tells them apart.
+    """
     t0 = pd.Timestamp("2026-09-10T07:00:00Z")
     rows, t, km, wh = [], t0, 0.0, 2000.0
     lat0, lon0 = -26.0, 28.0
     dlat = 0.5 / 111.0    # 0.5 km per node
 
-    def node(k):        # out-and-back: km 20..25 north, 25..30 back south
-        if k <= 25:
+    def node(k):        # out-and-back per pass: 5 km north, 5 km back
+        if k < 20:
             return lat0 + k * dlat, lon0
-        return lat0 + (50 - k) * dlat, lon0
+        local = (k - 20.0) % 10.0
+        north = 20.0 + (local if local <= 5.0 else 10.0 - local)
+        return lat0 + north * dlat, lon0
 
     def add_drive(n, v):
         nonlocal t, km, wh
@@ -62,7 +71,8 @@ def synthetic_plan(batt) -> planfile.Plan:
                              p_solar=600.0, p_motor=1300.0, p_aux=100.0, p_net=p_net,
                              Ws=p_net * dt, wh_remaining=wh - p_net * dt / 3600.0,
                              soc=0.6, wh_floor=291.0, v_pack_pred=115.0,
-                             leg="Loop 1" if km >= 20 else "ToControlStop",
+                             leg=(f"Loop {int((km - 20.0) // 10.0) + 1}"
+                                  if km >= 20 else "ToControlStop"),
                              kind="drive", panel="flat",
                              n_roundabout=1 if abs(km - 12.0) < 0.01 else 0,
                              n_traffic_signal=0))
@@ -90,7 +100,10 @@ def synthetic_plan(batt) -> planfile.Plan:
     add_stop("Fahrerwechsel km 10.0", 5, 600.0)
     add_drive(20, 60.0)                 # km 10..20
     add_stop("Kontrollstopp", 30, 900.0)
-    add_drive(20, 50.0)                 # km 20..30 (out and back)
+    for p in range(n_loops):
+        add_drive(20, 50.0)             # 10 km: out and back
+        if loop_stops:
+            add_stop(f"Loopstopp {p + 1}", 8, 900.0)
     tr = pd.DataFrame(rows)[planfile.TRACE_COLS]
     meta = {"format": 1, "day": 1, "day_date": "2026-09-10", "t_now": t0.isoformat(),
             "t_deadline": "2026-09-10T15:00:00+00:00",
@@ -98,11 +111,27 @@ def synthetic_plan(batt) -> planfile.Plan:
             "part_km": 20.0, "loop_leg": None, "loop_done": 0,
             "pack": {"wh": 2000.0, "soc": 0.68, "source": "test", "trust": "manual",
                      "capacity_wh": capacity_wh(batt), "floor_wh": 291.0},
-            "n_loops": 1, "km": 30.0, "avg_kmh": 56.0, "end_soc": 0.6, "min_soc": 0.6,
+            "n_loops": n_loops, "km": km, "avg_kmh": 56.0, "end_soc": 0.6, "min_soc": 0.6,
             "end_wh": wh, "cloud_margin": 0.9, "mode": "test",
             "driver_changes_km": [10.0], "reserve_s": 3600.0}
     meta["label"] = planfile.plan_label(meta)
     return planfile.Plan(meta=meta, tr=tr)
+
+
+def _driver_halt_ok(batt, plan) -> bool:
+    """Standing at a halt with no regulated minimum must not raise.
+
+    stops() carries reg_s through a DataFrame, so "no regulated minimum"
+    arrives as NaN rather than None - and pd.Timedelta(NaN) raises, which
+    took the whole status tick down.
+    """
+    t_arr = pd.Timestamp("2026-09-10T07:10:00Z")
+    tr = live.LiveTracker(plan, batt)
+    tr.pos.km, tr.pos.source = 10.0, "gps"
+    tr._still_since = t_arr
+    h = tr._halt_state(t_arr + pd.Timedelta(minutes=1), 10.0)
+    return (h["at_stop"] == "Fahrerwechsel km 10.0" and h["reg_s"] is None
+            and h["free_at"] == h["leave"])
 
 
 def main() -> int:
@@ -126,6 +155,53 @@ def main() -> int:
               f"{p2.time_at_km(10.0)}")
         lst = planfile.list_plans(Path(d))
         check("list_plans findet die Datei", len(lst) == 1 and lst[0]["label"] == plan.label)
+
+    print("Zeitstempel gemischter Genauigkeit")
+    # Timestamp.isoformat() laesst den Bruchteil weg, wenn er null ist. Das
+    # letzte Leg wird auf die Deadline geklemmt - eine runde Zeit -, also
+    # enthaelt jeder Plan, der den Tag ausnutzt, genau eine solche Zeile.
+    # pandas rat das Format aus dem ERSTEN Element und wendet es strikt an:
+    #   time data "2026-09-13T15:00:00+00:00" doesn't match format
+    #   "%Y-%m-%dT%H:%M:%S.%f%z"
+    # und der Plan laedt gar nicht mehr.
+    with tempfile.TemporaryDirectory() as d:
+        fp = Path(d) / "mixed.json"
+        rows = plan.tr.copy()
+        for c in ("t_start", "t_end"):
+            rows[c] = [planfile._iso(x) for x in rows[c]]
+        # Wie in der Wirklichkeit: der Planstart kommt aus `--time now` und
+        # hat Nanosekunden, die letzte Zeile ist auf die Deadline geklemmt
+        # und damit rund. Erstes Element gebrochen, ein Element rund - genau
+        # die Reihenfolge, die pandas auf die Nase fallen laesst.
+        ce = rows.columns.get_loc("t_end")
+        rows.iloc[:-1, ce] = [r.replace("+00:00", ".123456789+00:00")
+                              for r in rows["t_end"].iloc[:-1]]
+        rows.iloc[-1, ce] = "2026-09-13T15:00:00+00:00"
+        n_round = sum("." not in r for r in rows["t_end"])
+        n_frac = sum("." in r for r in rows["t_end"])
+        rows = rows.astype(object).where(pd.notna(rows), None)
+        import json as _json
+        fp.write_text(_json.dumps({"meta": plan.meta,
+                                   "columns": planfile.TRACE_COLS,
+                                   "rows": rows.to_numpy().tolist()}))
+        check("Spalte ist wirklich gemischt (runde UND gebrochene Sekunden)",
+              n_round > 0 and n_frac > 0, f"{n_round} rund / {n_frac} gebrochen")
+        try:
+            p3 = planfile.Plan.load(fp)
+            ok, why = True, str(p3.t_finish)
+        except Exception as e:
+            ok, why = False, f"{type(e).__name__}: {e}"
+        check("Plan mit gemischter Genauigkeit laedt", ok, why[:90])
+    payload_mixed = {"series": ["battery_voltage"],
+                     "points": [{"timestamp": "2026-09-13T14:59:59.5Z", "values": [118.0]},
+                                {"timestamp": "2026-09-13T15:00:00+00:00", "values": [118.1]},
+                                {"timestamp": "2026-09-13T15:00:00.5Z", "values": [118.2]}]}
+    try:
+        dm = ser_client.parse_range_json(payload_mixed)
+        ok2, why2 = len(dm) == 3, str(list(dm.index))
+    except Exception as e:
+        ok2, why2 = False, f"{type(e).__name__}: {e}"
+    check("Telemetrie-Batch mit runder Sekunde wird geparst", ok2, why2[:90])
 
     print("Lookups")
     check("time_at_km(10) = Abfahrt nach dem Wechsel (07:15)",
@@ -391,6 +467,116 @@ def main() -> int:
     tr.update_gps({"id": 10000, "time": t_a + pd.Timedelta(seconds=5), "lat": fixes[-1]["lat"],
                    "lon": fixes[-1]["lon"], "speed_kmh": 0.0})
     check("Release: naechster Fix setzt die Position wieder", abs(tr.pos.km - 20.0) < 0.3, f"{tr.pos.km}")
+
+    print("Loops: Pass und Hin-/Rueckweg")
+    lp = synthetic_plan(batt, n_loops=2, loop_stops=True)
+    passes = lp.loop_passes()
+    check("zwei Loop-Paesse erkannt, Wende aus den Koordinaten",
+          len(passes) == 2 and abs(passes[0]["km_turn"] - 25.0) < 0.6
+          and abs(passes[1]["km_turn"] - 35.0) < 0.6,
+          " / ".join(f"{p['leg']} {p['km_start']:.0f}-{p['km_turn']:.1f}-"
+                     f"{p['km_end']:.0f}" for p in passes))
+    check("jeder Pass kennt seinen Loopstopp",
+          [p["stop"] for p in passes] == ["Loopstopp 1", "Loopstopp 2"],
+          str([p["stop"] for p in passes]))
+    check("loop_at_km unterscheidet Hin- und Rueckweg",
+          lp.loop_at_km(22.0)["half"] == "out"
+          and lp.loop_at_km(28.0)["half"] == "back"
+          and lp.loop_at_km(15.0) is None)
+    # darum geht es ueberhaupt: km 23 und km 27 sind dieselbe Stelle
+    c_out, c_back = lp.coord_at_km(23.0), lp.coord_at_km(27.0)
+    check("Hin- und Rueckweg teilen sich die Koordinate",
+          abs(c_out[0] - c_back[0]) < 1e-6 and abs(c_out[1] - c_back[1]) < 1e-6,
+          f"{c_out} / {c_back}")
+    trl = live.LiveTracker(lp, batt)
+    trl.pos.lat, trl.pos.lon = c_back
+    trl.pos.km, trl.pos.source = 23.0, "gps"        # falsch erkannt: Hinweg
+    r = trl.set_loop(1, "back")
+    check("set_loop korrigiert auf den Rueckweg desselben Passes",
+          abs(trl.pos.km - 27.0) < 0.3 and r["cross_m"] < 50,
+          f"km {trl.pos.km:.2f}, {r['cross_m']:.0f} m")
+    check("set_loop haelt die Position NICHT fest (GPS uebernimmt wieder)",
+          trl.pos.hold is False and trl.pos.source == "gps")
+    trl.pos.km = 37.0                                # falscher Pass
+    trl.set_loop(1, "back")
+    check("set_loop korrigiert auch den Pass (2 -> 1)",
+          abs(trl.pos.km - 27.0) < 0.3, f"km {trl.pos.km:.2f}")
+    trl2 = live.LiveTracker(lp, batt)
+    trl2.pos.lat, trl2.pos.lon = lp.coord_at_km(32.0)
+    trl2.pos.km, trl2.pos.source = 22.0, "gps"
+    trl2.set_loop(2, "out")
+    check("Loop 2 Hinweg landet im zweiten Pass", abs(trl2.pos.km - 32.0) < 0.3,
+          f"km {trl2.pos.km:.2f}")
+
+    print("Loopstopp: zu frueh angekommen")
+    # Ein Loopstopp dauert fuenf Minuten, drei Minuten zu frueh sind also
+    # normal. Vorher gemessen: at_stop None, keine Haltebox, und eine
+    # bestaetigte Ankunft liess sich nicht einmal zuordnen.
+    _ls = lp.stops()
+    _ls = _ls[_ls["name"] == "Loopstopp 1"].iloc[0]
+    t_early = _ls["t_arrive"] - pd.Timedelta(minutes=6)
+    r_drive = lp.stop_at(30.0, t_early, standing=False)
+    r_stand = lp.stop_at(30.0, t_early, standing=True)
+    check("fahrend zaehlt der Halt 6 min vor der Planankunft nicht",
+          r_drive is None)
+    check("stehend ist es der Loopstopp, Uhrzeit hin oder her",
+          r_stand is not None and str(r_stand["name"]) == "Loopstopp 1",
+          "None" if r_stand is None else str(r_stand["name"]))
+    trs = live.LiveTracker(lp, batt)
+    trs.pos.km, trs.pos.source = 30.0, "gps"
+    trs._still_since = t_early
+    hs = trs._halt_state(t_early + pd.Timedelta(minutes=1), 30.0)
+    check("weiter ab = Ankunft + 5 min Reglement, auch 6 min zu frueh",
+          hs["at_stop"] == "Loopstopp 1"
+          and hs["free_at"] == t_early + pd.Timedelta(minutes=5)
+          and abs(hs["late_min"] + 6.0) < 0.01,
+          f"{hs['at_stop']} frei {hs.get('free_at')} ({hs.get('late_min')} min)")
+    e = trs.log_stop(t_early + pd.Timedelta(minutes=1), at=t_early)
+    check("bestaetigte Ankunft am Loopstopp wird zugeordnet",
+          e["stop"] == "Loopstopp 1"
+          and trs.confirmed_arrival("Loopstopp 1") == t_early,
+          str(e["stop"]))
+    check("bestaetigt gewinnt auch am Loopstopp",
+          trs._halt_state(t_early + pd.Timedelta(minutes=1),
+                          30.0)["source"] == "confirmed")
+
+    check("Halt ohne Reglement (Fahrerwechsel) kippt den Tick nicht",
+          _driver_halt_ok(batt, synthetic_plan(batt)),
+          "reg_s ist NaN, nicht None")
+
+    print("Plausibilitaet der Leistung")
+    # Ein einziges Schrott-Sample aus dem MPPT-Frame hat die Tagessonne
+    # frueher auf 6.1e27 Wh gehoben - v_pack und i_batt waren abgesichert,
+    # p_solar nicht. Der Kanal wird jetzt verworfen, nicht integriert.
+    from data_analysis.simulation.live_monitor import LiveEnergy, TelemetrySigns  # noqa
+    t0 = pd.Timestamp("2026-09-10T07:00:00Z")
+    en = LiveEnergy(batt, wh_start=2000.0)
+    for k in range(60):
+        p = [150.0, 1.1e31 if k == 30 else 150.0, 150.0, 150.0]
+        en.update(t0 + pd.Timedelta(seconds=k), 115.0, -5.0, p_solar=p)
+    st_e = en.status()
+    check("Schrott-Sample auf einem MPPT bleibt ohne Wirkung",
+          9.0 < st_e["wh_solar"] < 10.5 and st_e["n_solar_rejected"] == 1,
+          f"{st_e['wh_solar']} Wh, {st_e['n_solar_rejected']} verworfen")
+    check("die anderen drei Kanaele des Samples zaehlen weiter",
+          en._rows[30]["p_solar"] == 450.0, f"{en._rows[30]['p_solar']} W")
+    en2 = LiveEnergy(batt, wh_start=2000.0)
+    en2.update(t0, 115.0, -5.0, p_solar=600.0)
+    en2.update(t0 + pd.Timedelta(seconds=1), 115.0, -5.0, p_solar=600.0)
+    check("eine plausible Summe ueber alle MPPTs wird NICHT verworfen",
+          en2.status()["n_solar_rejected"] == 0, str(en2.status()["n_solar_rejected"]))
+    # Der echte Log vom 12.09. spannt intern von Juni bis September. Ein
+    # Trapez ueber so ein Loch erfindet mehr Energie als der Pack fasst.
+    en3 = LiveEnergy(batt, wh_start=2000.0)
+    en3.update(t0, 115.0, -12.0)
+    en3.update(t0 + pd.Timedelta(hours=40), 115.0, -12.0)
+    s3 = en3.status()
+    check("Loch von 40 h wird NICHT ueberbrueckt, sondern gemeldet",
+          s3["n_breaks"] == 1 and abs(s3["wh_used"]) < 1e-6,
+          f"{s3['wh_used']} Wh, {s3['n_breaks']} Abbrueche, {s3['break_s']} s")
+    en3.update(t0 + pd.Timedelta(hours=40, seconds=1), 115.0, -12.0)
+    check("nach dem Abbruch laeuft die Integration normal weiter",
+          en3.status()["wh_used"] > 0, f"{en3.status()['wh_used']} Wh")
 
     print("Telemetrie-Client")
     payload = {"series": ["speed", "battery_voltage", "battery_current", "mppt3_power"],

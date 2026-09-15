@@ -40,12 +40,18 @@ def _clock(t) -> str:
 
 # ------------------------------------------------------------------ header ----
 
-def header(state, weathers: dict, solar_check: dict = None) -> str:
+def header(state, weathers: dict, solar_check: dict = None,
+           panel_flat: bool = False, aim_morning: bool = False) -> str:
     """Position, time, energy and data provenance - printed before anything.
 
     The provenance lines are not decoration. A plan on a hand-typed SoC and
     a plan on a settled anchor are different plans, and a seven hour old
     forecast is itself a reason to decide more cautiously.
+
+    The panel line belongs in the same list and for the same reason: a plan
+    on a flat panel is a different plan, and the halt lengths in it look
+    identical to a tracked one. Only printed when it is NOT the normal case
+    - a line that appears on every run is a line nobody reads.
     """
     L = []
     part_de = {"to_control": "vor dem Kontrollstopp",
@@ -80,6 +86,12 @@ def header(state, weathers: dict, solar_check: dict = None) -> str:
                  + (f" ({cw.fetched_at.astimezone(RACE_TZ):%d.%m %H:%M} SAST)"
                     if cw.fetched_at else "")
                  + f", {len(cw.weather.distance_km)} Punkte")
+    if panel_flat:
+        L.append("Panel     flach - wird an keinem Halt ausgerichtet. "
+                 "Standzeiten unveraendert,")
+        L.append("          Ertrag im Stand mit GHI statt nachgefuehrtem GTI"
+                 + (", Morgenfenster ausgerichtet (--aim-morning)"
+                    if aim_morning else ", Morgenfenster ebenfalls flach"))
     if solar_check:
         L.append(f"Solar     gemessen {solar_check['measured_w']:.0f} W · "
                  f"Prognose {solar_check['forecast_w']:.0f} W · "
@@ -113,6 +125,9 @@ def options_table(opts: list, batt=None) -> str:
                  f"{'—' if o.cloud_margin is None else f'{100*o.cloud_margin:.0f} %':>12}"
                  + (f"   {o.wh_spilled:>5.0f} Wh verworfen"
                     if o.wh_spilled > 5 else ""))
+
+    if any(getattr(o, "panel_flat", False) for o in opts):
+        L.insert(1, "(Panel flach, keine Ausrichtung an den Halten)")
 
     if last_ok is None:
         L.append("\nKeine Option machbar - siehe Grund oben.")
@@ -229,7 +244,9 @@ def plan_text(opt, state) -> str:
         return f"\nPlan mit {opt.n_loops} Loop(s) nicht machbar: {opt.reason}"
 
     L = ["", f"Plan mit {opt.n_loops} Loop(s): {opt.km:.1f} km, "
-             f"Ø {opt.avg_kmh:.1f} km/h, Fahrzeit {_hm(opt.drive_time)}", ""]
+             f"Ø {opt.avg_kmh:.1f} km/h, Fahrzeit {_hm(opt.drive_time)}"
+             + (" · Panel flach" if getattr(opt, "panel_flat", False)
+                else ""), ""]
 
     # one chronological list: driving zones and standing phases interleaved,
     # because that is the order they happen in and the order they get read out
@@ -324,6 +341,15 @@ def floor_alternative(opt) -> str:
     freed = opt.drive_time - t_alt
     if freed.total_seconds() < 300:
         return ""
+    if getattr(opt, "panel_flat", False):
+        # The energy half of the trade disappears with a flat panel:
+        # standing and crawling then collect the same GHI, and standing
+        # only saves the motor term. The PENALTY is the whole reason left.
+        return (f"          Alternative: mindestens {V_FLOOR_KMH:.0f} km/h "
+                f"fahren (Fahrzeit {_hm(t_alt)}) und die frei werdenden "
+                f"{freed.total_seconds()/60:.0f} min stehen. Mit flachem "
+                f"Panel bringt das Stehen keinen Ertragsvorteil mehr, nur "
+                f"den gesparten Fahrverbrauch - der Grund ist der Penalty")
     return (f"          Alternative: mindestens {V_FLOOR_KMH:.0f} km/h fahren "
             f"(Fahrzeit {_hm(t_alt)}) und die frei werdenden "
             f"{freed.total_seconds()/60:.0f} min stehend laden. Ob das auch "
@@ -331,20 +357,30 @@ def floor_alternative(opt) -> str:
             f"--stop KM:{freed.total_seconds()/60:.0f} nachrechnen")
 
 
-def sweep_text(rows: list, batt, km: float, wh_ceiling: float = None) -> str:
+def sweep_text(rows: list, batt, km: float, wh_ceiling: float = None,
+               aim: bool = None, panel_flat: bool = False) -> str:
     """The standing-phase sweep as a table, with the useful row marked.
 
     "morgen nutzbar" is min(end energy, ceiling): energy above the next
     morning's ceiling is worthless, since it would have arrived free in the
     morning window anyway. Which is why the best row is often NOT the one
     with the highest end SoC.
+
+    `aim` / `panel_flat` only decide the caption. It has to be there: the
+    same table with an aimed and with a flat panel points at two different
+    optimal lengths, and two printouts that differ in nothing but a column
+    of numbers are impossible to tell apart an hour later.
     """
     from data_analysis.simulation.battery import capacity_wh
     cap = capacity_wh(batt)
 
     where = (f"{abs(km):.1f} km vor dem Ziel" if km < 0
              else f"km {km:.1f}")
-    L = ["", f"Standladen {where}, Dauer variiert"]
+    flat_here = (not aim) if aim is not None else panel_flat
+    how = "flach" if flat_here else "ausgerichtet"
+    if aim is not None and aim != (not panel_flat):
+        how += ", abweichend vom Tag"
+    L = ["", f"Standladen {where} ({how}), Dauer variiert"]
     L.append(f"{'Dauer':>7} {'Ø km/h':>7} {'Ende':>7} {'min SOC':>8} "
              f"{'verworfen':>10} {'Ladung':>9} {'morgen nutzbar':>15}")
 

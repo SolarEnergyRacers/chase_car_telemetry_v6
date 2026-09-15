@@ -232,6 +232,59 @@ class LiveTracker:
             self.pos.lat, self.pos.lon = self.plan.coord_at_km(self.pos.km)
         log.info("Position aus der Historie gesetzt: km %.2f", self.pos.km)
 
+    def set_loop(self, nr: int, half: str = None) -> dict:
+        """Say which pass of the loop the car is on, and which half.
+
+        The correction a wrong detection needs. Every pass of a loop shares
+        its coordinates with every other pass, and the outbound half shares
+        them with the return half, so the GPS alone can never settle either
+        question - the projection carries the answer forward from the
+        previous fix, and a single bad jump (plan loaded mid-loop, GPS hole
+        at the turnaround, a detour) leaves it wrong for the rest of the
+        day. Measured once: km 90.7 instead of 22.8, and with it a schedule
+        deviation of -138 minutes.
+
+        This is NOT the manual position: it does not hold the km against
+        the GPS. It re-seeds the pass and hands tracking straight back to
+        the GPS, which is then searched inside the named half - the car
+        keeps moving on its own from there.
+        """
+        lo, hi = self.plan.loop_window(nr, half)
+        km, cross = lo, None
+        if self.pos.lat is not None and self.pos.lon is not None:
+            try:
+                km, cross = self.plan.project(self.pos.lat, self.pos.lon,
+                                              after_km=lo,
+                                              window_km=max(hi - lo, 0.05))
+            except ValueError:
+                km, cross = lo, None
+        self.pos.km = float(np.clip(km, lo, hi))
+        self.pos.source = "gps"
+        self.pos.hold = False
+        self.pos.frozen = False
+        self.pos.off_route = False
+        if cross is not None:
+            self.pos.cross_m = float(cross)
+        cur = self.plan.loop_at_km(self.pos.km) or {}
+        what = f"Loop {nr}" + ({"out": " Hinweg", "back": " Rückweg"}.get(half, ""))
+        # The statement is obeyed either way - the strategist may be
+        # correcting precisely because the GPS is stale or wrong. But a fix
+        # kilometres away from the half just named is far more likely the
+        # wrong entry than the right correction, and saying so beats a
+        # silent jump followed by the next fix snapping back.
+        far = (cross is not None and cross > CROSS_LOST_M)
+        self.notes.append(
+            f"{what} von Hand gesetzt (km {self.pos.km:.1f})"
+            + (f" — ACHTUNG: GPS liegt {cross/1000:.1f} km daneben" if far else ""))
+        log.log(lg.WARNING if far else lg.INFO,
+                "Loop von Hand gesetzt: %s -> km %.2f (Fenster %.1f-%.1f, "
+                "%s m neben der Route)", what, self.pos.km, lo, hi,
+                "?" if cross is None else f"{cross:.0f}")
+        return {"nr": int(nr), "half": half or cur.get("half"),
+                "km": float(self.pos.km), "km_lo": float(lo),
+                "km_hi": float(hi), "far": bool(far),
+                "cross_m": (None if cross is None else float(cross))}
+
     def update_gps(self, fix: dict) -> None:
         """Project one GPS fix onto the plan (sequential, loop-safe)."""
         if fix is None or fix.get("lat") is None or fix.get("lon") is None:
@@ -610,6 +663,30 @@ class LiveTracker:
             return float(self.pos.gps_speed_kmh), "gps_alt"
         return None, None
 
+    def _loops_state(self) -> dict:
+        """The loop passes of this plan and the one the car is detected on.
+
+        Both halves of a pass are offered separately only where they exist:
+        a remainder leg that is all return leg must not offer an outbound
+        half that would silently snap the car to the wrong place.
+        """
+        passes = self.plan.loop_passes()
+        if not passes:
+            return None
+        cur = self.plan.loop_at_km(self.pos.km)
+        return {
+            "passes": [{"nr": p["nr"], "leg": p["leg"],
+                        "km_start": _f(p["km_start"], 1),
+                        "km_turn": _f(p["km_turn"], 1),
+                        "km_end": _f(p["km_end"], 1),
+                        "has_out": p["out_km"] > 0.05,
+                        "has_back": p["back_km"] > 0.05,
+                        "stop": p["stop"]} for p in passes],
+            "current": (None if cur is None
+                        else {"nr": cur["nr"], "half": cur["half"],
+                              "leg": cur["leg"]}),
+        }
+
     def _halt_state(self, now, km: float) -> dict:
         """If the car stands in a planned halt: since when, and until when.
 
@@ -643,15 +720,19 @@ class LiveTracker:
             return {"at_stop": None, "remaining_s": 0.0, "late_min": None}
         late_min = (arrived - r["t_arrive"]).total_seconds() / 60.0
         leave = arrived + pd.Timedelta(seconds=float(r["dur_s"]))
+        # A halt with no regulated minimum (driver change, charging stop)
+        # carries reg_s as NaN once stops() has been through a DataFrame,
+        # and NaN is not None - `pd.Timedelta(NaN)` raises, which took the
+        # whole tick down as soon as the car stood at a driver change.
         reg = r["reg_s"]
+        reg = None if reg is None or not np.isfinite(float(reg)) else float(reg)
         free_at = (leave if reg is None
-                   else arrived + pd.Timedelta(seconds=float(reg)))
+                   else arrived + pd.Timedelta(seconds=reg))
         return {"at_stop": name, "km": float(r["km"]),
                 "remaining_s": max((leave - now).total_seconds(), 0.0),
                 "free_s": max((free_at - now).total_seconds(), 0.0),
                 "late_min": late_min, "arrived": arrived, "leave": leave,
-                "free_at": free_at, "reg_s": (None if reg is None
-                                              else float(reg)),
+                "free_at": free_at, "reg_s": reg,
                 "dur_s": float(r["dur_s"]),
                 "source": "confirmed" if confirmed is not None else "speed"}
 
@@ -773,7 +854,7 @@ class LiveTracker:
                      "pack_source": plan.meta["pack"].get("source"),
                      "pack_trust": plan.meta["pack"].get("trust")},
             "position": None, "speed": None, "next": None, "finish": None,
-            "upcoming": [],
+            "upcoming": [], "loops": self._loops_state(),
             "driver": None, "energy": None, "sun": None, "strip": None,
             "curve": None, "telemetry": self._telemetry_health(now),
             "notes": list(self.notes[-5:]),
@@ -907,6 +988,9 @@ class LiveTracker:
                                   if st["projected_end_wh"] is not None else None),
             "n_gaps": st["n_gaps"], "wh_bridged": _f(st["wh_bridged"], 0),
             "n_rejected": st["n_rejected"],
+            "n_solar_rejected": st.get("n_solar_rejected", 0),
+            "n_breaks": st.get("n_breaks", 0),
+            "break_s": _f(st.get("break_s"), 0),
             "v_pack": _f(means.get("v"), 1), "i_batt": _f(means.get("i"), 1),
             "p_batt": _f(means.get("p_batt"), 0),
             "cap_wh": _f(capacity_wh(self.batt), 0),

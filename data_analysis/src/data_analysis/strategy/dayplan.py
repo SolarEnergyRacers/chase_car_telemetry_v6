@@ -52,6 +52,18 @@ LOOP_STOP    = timedelta(minutes=8)
 CONTROL_STOP_TRACKED = timedelta(minutes=28)
 LOOP_STOP_TRACKED    = timedelta(minutes=5)
 
+# `panel_flat=True` sets every one of those shares to zero: the panel cannot
+# be aimed at all and lies flat through the whole day, halts included. A
+# property of the CAR, not of a single halt - which is why it is one
+# parameter on evaluate() and not a tracked_min on each StopSpec. The halt
+# LENGTHS stay as they are: the 30 regulated minutes at the control stop are
+# owed whether or not anything is charging.
+#
+# The one halt that may disagree with the day is a planned charging stop:
+# StopSpec.aim overrides panel_flat in either direction, because forty
+# minutes standing is enough time to aim a panel by hand and a five minute
+# loop break is not. See StopSpec.tracked_against().
+
 # A driver may not sit at the wheel for more than two hours at a stretch.
 # The change costs five minutes and the panel stays flat - nobody sets it
 # up for five minutes. Any other halt also counts as a break, so the
@@ -169,12 +181,20 @@ class StopSpec:
 
     `tracked_min` splits the halt: that many minutes with the panel aimed at
     the sun, the rest lying flat. None means the whole halt is tracked.
+
+    `aim` decides whether this halt aims AT ALL, against the day's setting:
+    None follows it, True aims even on a --flat-panel day, False stays flat
+    even on a normal one. A planned charging stop is the one halt where
+    that can differ from the rest of the day - forty minutes is enough time
+    to prop a panel up by hand or to turn the car, five minutes in a loop
+    break is not.
     """
     km: float = None
     minutes: float = 30.0
     label: str = "Standladen"
     tracked_min: float = None
     at_time: datetime = None
+    aim: bool = None
 
     @property
     def duration(self) -> timedelta:
@@ -185,6 +205,16 @@ class StopSpec:
         if self.tracked_min is None:
             return self.duration
         return timedelta(minutes=min(self.tracked_min, self.minutes))
+
+    def tracked_against(self, panel_flat: bool) -> timedelta:
+        """Aimed share of this halt, given the day's panel setting.
+
+        One place for the whole rule, so that `aim` and `tracked_min`
+        cannot be combined differently in two callers.
+        """
+        if self.aim is False or (self.aim is None and panel_flat):
+            return timedelta(0)
+        return self.tracked_for
 
 
 def _as_stop_specs(items) -> list:
@@ -232,13 +262,24 @@ class Leg:
         return max(self.duration - t, timedelta(0))
 
 
+def _tracked(nominal: timedelta, panel_flat: bool) -> timedelta:
+    """Aimed share of a halt, zero if the panel cannot be aimed at all.
+
+    One place for the decision, so that a halt added later - a charging
+    stop from --stop, the leftover standing phase before the finish line -
+    cannot silently keep charging on a tracked panel the car does not have.
+    """
+    return timedelta(0) if panel_flat else nominal
+
+
 def build_legs(state, parts: dict, n_loops: int,
-               extra_stops: list = None) -> list:
+               extra_stops: list = None, panel_flat: bool = False) -> list:
     """Order the remaining legs of the day for a given loop count.
 
     `parts` maps 'to_control' / 'loop' / 'to_finish' to (route, weather)
     pairs, as produced by load_day(). `n_loops` counts loops still to be
-    driven, not loops in total.
+    driven, not loops in total. `panel_flat` says the panel is never aimed;
+    every halt then charges at GHI instead of tracked GTI.
 
     A day can be entered at three points, and the sequence differs for each:
     before the control stop the mandatory stop is still ahead, on a loop the
@@ -252,8 +293,9 @@ def build_legs(state, parts: dict, n_loops: int,
         legs.append(Leg("ToControlStop", "drive",
                         route_from(route, state.km_in_part * 1e3), weather))
         legs.append(Leg("Kontrollstopp", "stop", duration=CONTROL_STOP,
-                        tracked_for=CONTROL_STOP_TRACKED))
-        _append_loops(legs, parts, n_loops)
+                        tracked_for=_tracked(CONTROL_STOP_TRACKED,
+                                             panel_flat)))
+        _append_loops(legs, parts, n_loops, panel_flat)
         _append_to_finish(legs, parts)
 
     elif state.part == "loop":
@@ -262,8 +304,8 @@ def build_legs(state, parts: dict, n_loops: int,
         legs.append(Leg("Loop (laufend, Rest)", "drive",
                         route_from(route, state.km_in_part * 1e3), weather))
         legs.append(Leg("Loopstopp", "stop", duration=LOOP_STOP,
-                        tracked_for=LOOP_STOP_TRACKED))
-        _append_loops(legs, parts, n_loops)
+                        tracked_for=_tracked(LOOP_STOP_TRACKED, panel_flat)))
+        _append_loops(legs, parts, n_loops, panel_flat)
         _append_to_finish(legs, parts)
 
     elif state.part == "to_finish":
@@ -288,11 +330,12 @@ def build_legs(state, parts: dict, n_loops: int,
                 continue
             resolved.append(replace(s, km=km))
         if resolved:
-            legs = _splice_stops(legs, resolved)
+            legs = _splice_stops(legs, resolved, panel_flat)
     return legs
 
 
-def _append_loops(legs: list, parts: dict, n_loops: int) -> None:
+def _append_loops(legs: list, parts: dict, n_loops: int,
+                  panel_flat: bool = False) -> None:
     if n_loops <= 0:
         return
     if "loop" not in parts:
@@ -302,7 +345,7 @@ def _append_loops(legs: list, parts: dict, n_loops: int) -> None:
     for k in range(n_loops):
         legs.append(Leg(f"Loop {k+1}", "drive", route, weather))
         legs.append(Leg(f"Loopstopp {k+1}", "stop", duration=LOOP_STOP,
-                        tracked_for=LOOP_STOP_TRACKED))
+                        tracked_for=_tracked(LOOP_STOP_TRACKED, panel_flat)))
 
 
 def _append_to_finish(legs: list, parts: dict) -> None:
@@ -315,7 +358,7 @@ def _append_to_finish(legs: list, parts: dict) -> None:
     legs.append(Leg("FromControlStop", "drive", route, weather))
 
 
-def _splice_stops(legs: list, specs: list) -> list:
+def _splice_stops(legs: list, specs: list, panel_flat: bool = False) -> list:
     """Insert standing phases at given distances from the current position.
 
     The bookkeeping detail that matters: after a leg is split, `leg` is the
@@ -360,8 +403,21 @@ def _splice_stops(legs: list, specs: list) -> list:
 
             node = leg.route.iloc[i]
             at_km = leg_start + cut + local / 1e3
-            out.append(Leg(f"{s.label} km {at_km:.1f}", "stop",
-                           duration=s.duration, tracked_for=s.tracked_for,
+            # A halt that disagrees with the day says so in its NAME, not
+            # just in a Wh figure: the plan is read aloud in a moving car,
+            # and "Standladen km 45.0 (ausgerichtet)" is an instruction to
+            # the crew, while a silent name is not.
+            tf = s.tracked_against(panel_flat)
+            mark = ""
+            if s.aim is True and panel_flat:
+                mark = " (ausgerichtet)"
+            elif s.aim is False and not panel_flat:
+                mark = " (flach)"
+            elif tf > timedelta(0) and tf < s.duration:
+                mark = f" ({tf.total_seconds()/60:.0f} min ausgerichtet)"
+            out.append(Leg(f"{s.label} km {at_km:.1f}{mark}", "stop",
+                           duration=s.duration,
+                           tracked_for=tf,
                            lat=float(node["latitude"]),
                            lon=float(node["longitude"])))
             leg = Leg(f"{leg.name} (nach Stopp)", "drive",
@@ -404,6 +460,7 @@ class DayOption:
     stop_time: timedelta = None          # total standing time
     stand_extra: timedelta = None        # leftover time parked before the line
     floor_released: bool = False         # 50 km/h given up to reach the finish
+    panel_flat: bool = False             # panel never aimed, halts at GHI
 
     def wh_loss_note(self) -> str:
         """One line about the pack overflowing, for a plot title."""
@@ -418,7 +475,8 @@ def evaluate(state, parts: dict, n_loops: int, car: Car_coeffs,
              arrive_early: timedelta = timedelta(0),
              driver_changes: list = None,
              auto_driver_change: bool = True,
-             v_floor: bool = True) -> DayOption:
+             v_floor: bool = True,
+             panel_flat: bool = False) -> DayOption:
     """Plan the rest of the day, keeping to the 50 km/h floor if possible.
 
     Two passes at most. The first holds the regulation floor: leftover time
@@ -426,16 +484,21 @@ def evaluate(state, parts: dict, n_loops: int, car: Car_coeffs,
     as a crawl. If that plan runs out of energy, the floor is given up -
     driving below 50 costs a penalty, not arriving costs the classification
     - and the result says so.
+
+    `panel_flat=True` means the panel is never aimed - it lies flat through
+    every halt as well as while driving. The halts stay in the plan at their
+    full length, they simply earn GHI instead of tracked GTI.
     """
     opt = _evaluate_with_changes(state, parts, n_loops, car, batt,
                                  extra_stops, arrive_early, driver_changes,
-                                 auto_driver_change, v_floor=v_floor)
+                                 auto_driver_change, v_floor=v_floor,
+                                 panel_flat=panel_flat)
     if v_floor and not opt.feasible and opt.reason.startswith("Energie"):
         log.info("50-km/h-Boden aufgegeben: mit ihm reicht die Energie nicht")
         alt = _evaluate_with_changes(state, parts, n_loops, car, batt,
                                      extra_stops, arrive_early,
                                      driver_changes, auto_driver_change,
-                                     v_floor=False)
+                                     v_floor=False, panel_flat=panel_flat)
         alt.floor_released = True
         if alt.feasible:
             return alt
@@ -446,7 +509,8 @@ def evaluate(state, parts: dict, n_loops: int, car: Car_coeffs,
 def _evaluate_with_changes(state, parts: dict, n_loops: int,
                            car: Car_coeffs, batt: Battery_coeffs,
                            extra_stops, arrive_early, driver_changes,
-                           auto_driver_change, v_floor: bool) -> DayOption:
+                           auto_driver_change, v_floor: bool,
+                           panel_flat: bool = False) -> DayOption:
     """Can the rest of the day be driven with `n_loops` loops still to go?
 
     The plan uses the WHOLE remaining time window. That is deliberate: for a
@@ -472,7 +536,8 @@ def _evaluate_with_changes(state, parts: dict, n_loops: int,
     # adding is monotone and terminates.
     for _ in range(12):
         opt = _evaluate_once(state, parts, n_loops, car, batt,
-                             fixed + placed, arrive_early, v_floor)
+                             fixed + placed, arrive_early, v_floor,
+                             panel_flat)
         if not opt.feasible or opt.trace is None:
             break
         if not timed_done:
@@ -553,9 +618,10 @@ def _resolve_timed(specs: list, opt: DayOption) -> list:
 def _evaluate_once(state, parts: dict, n_loops: int, car: Car_coeffs,
                    batt: Battery_coeffs, stops: list,
                    arrive_early: timedelta,
-                   v_floor: bool = True) -> DayOption:
+                   v_floor: bool = True,
+                   panel_flat: bool = False) -> DayOption:
     """One pass: fixed set of standing phases, one speed allocation."""
-    legs = build_legs(state, parts, n_loops, stops)
+    legs = build_legs(state, parts, n_loops, stops, panel_flat=panel_flat)
     drive_legs = [l for l in legs if l.kind == "drive"]
     stop_time = sum((l.duration for l in legs if l.kind == "stop"),
                     timedelta(0))
@@ -564,7 +630,7 @@ def _evaluate_once(state, parts: dict, n_loops: int, car: Car_coeffs,
     t_drive = window - stop_time
     km = sum(l.km for l in drive_legs)
     opt = DayOption(n_loops=n_loops, feasible=True, km=km, legs=legs,
-                    stop_time=stop_time)
+                    stop_time=stop_time, panel_flat=panel_flat)
 
     if t_drive.total_seconds() <= 0:
         opt.feasible = False
@@ -607,8 +673,13 @@ def _evaluate_once(state, parts: dict, n_loops: int, car: Car_coeffs,
             # the halts the strategist asked for with --stop. This one is
             # the time the floor left over, and telling them apart matters
             # both when reading the plan and when filtering the trace.
+            # With panel_flat the "+152 %" above is gone - a flat panel
+            # standing collects exactly what it would collect driving. The
+            # phase stays all the same: it is the answer to the 50 km/h
+            # floor, i.e. a PENALTY question, not an energy one.
             legs.append(Leg("Restzeit stehend vor der Ziellinie", "stop",
-                            duration=extra, tracked_for=extra))
+                            duration=extra,
+                            tracked_for=_tracked(extra, panel_flat)))
             stop_time += extra
             opt.stand_extra = extra
             opt.stop_time = stop_time
@@ -802,13 +873,15 @@ class MorningCharge:
                                       # energy in the pack is not.
     lat: float = None
     lon: float = None
+    tracked: bool = True              # panel aimed in the morning window
 
 
 def morning_charge(weather: RouteWeather, lat: float, lon: float,
                    t_release: datetime, t_start: datetime,
                    car: Car_coeffs, batt: Battery_coeffs,
                    wh_start: float,
-                   step: timedelta = timedelta(minutes=10)) -> MorningCharge:
+                   step: timedelta = timedelta(minutes=10),
+                   tracked: bool = True) -> MorningCharge:
     """Integrate the next morning's charge at the overnight stop.
 
     The pack is sealed on arrival and released at 06:00, so between those
@@ -829,6 +902,13 @@ def morning_charge(weather: RouteWeather, lat: float, lon: float,
     The location is the overnight stop, which is the same place as the next
     day's first route point. Weather must therefore be the NEXT day's
     RouteWeather; sampling today's would be one day off.
+
+    `tracked=False` for a panel that cannot be aimed. It matters more here
+    than anywhere else: at 06:00-08:00 the sun is low, and tracked/flat
+    tends towards 1/sin(elevation), so a tracked assumption can be a factor
+    of two out. And the error has a direction - too much `offered` lowers
+    wh_max_arrival, which advises arriving emptier than the morning can
+    actually refill.
     """
     n = max(int((t_start - t_release) / step), 1)
     rows, wh, spilled = [], float(wh_start), 0.0
@@ -836,7 +916,7 @@ def morning_charge(weather: RouteWeather, lat: float, lon: float,
     wh_unc = float(wh_start)
     t = t_release
     for _ in range(n):
-        ws = Ws_for_stop(car, weather, t, step, lat, lon, tracked=True)
+        ws = Ws_for_stop(car, weather, t, step, lat, lon, tracked=tracked)
         wh_unc -= ws / 3600.0
         wh -= ws / 3600.0
         if wh > cap:
@@ -851,7 +931,7 @@ def morning_charge(weather: RouteWeather, lat: float, lon: float,
     return MorningCharge(
         trace=df, t_release=t_release, t_start=t_start, wh_start=wh_start,
         wh_end=wh, offered=offered, absorbed=wh - wh_start, spilled=spilled,
-        wh_max_arrival=cap - offered, lat=lat, lon=lon)
+        wh_max_arrival=cap - offered, lat=lat, lon=lon, tracked=tracked)
 
 
 def _add_floor_curve(trace: pd.DataFrame, need_ws: np.ndarray,
@@ -969,7 +1049,8 @@ def _weather_for(legs: list, stop: Leg) -> RouteWeather:
 
 def sweep_stop(state, parts: dict, n_loops: int, car: Car_coeffs,
                batt: Battery_coeffs, km: float, extra_stops: list = None,
-               step_min: int = 15, max_min: int = 120, **kw) -> list:
+               step_min: int = 15, max_min: int = 120,
+               aim: bool = None, **kw) -> list:
     """Vary the length of one standing phase and report what each buys.
 
     The trade is not obvious and not monotone. Driving faster to make room
@@ -984,6 +1065,11 @@ def sweep_stop(state, parts: dict, n_loops: int, car: Car_coeffs,
     while the end value grows; and energy above the next morning's ceiling
     is worthless, because it would have arrived free anyway.
 
+    `aim` is the panel at THIS halt: None follows the day's panel_flat,
+    True aims it anyway, False keeps it flat. Worth sweeping both ways on a
+    flat-panel day - the optimum length moves, because a flat halt buys
+    less per minute and the v^3 term overtakes it sooner.
+
     Returns [(minutes, DayOption)], stopping one row after the first
     infeasible one.
     """
@@ -993,7 +1079,7 @@ def sweep_stop(state, parts: dict, n_loops: int, car: Car_coeffs,
         stops = list(base)
         if minutes > 0:
             stops.append(StopSpec(km=km, minutes=float(minutes),
-                                  label="Standladen"))
+                                  label="Standladen", aim=aim))
         opt = evaluate(state, parts, n_loops, car, batt,
                        extra_stops=stops, **kw)
         out.append((minutes, opt))

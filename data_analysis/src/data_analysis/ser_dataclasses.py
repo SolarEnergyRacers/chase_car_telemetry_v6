@@ -20,7 +20,7 @@ class Car_coeffs:
                                # calculated. Scales v1/vu/vd linearly ->
                                # replace with scrutineering scale value.
     panel_sqm: float = 6.0     # m² solar cell area: 387 cells * 155 cm² = 5.999
-    panel_eff: float = 0.21    # 0.254 (Maxeon Gen7 mid bin)
+    panel_eff: float = 0.19    # 0.254 (Maxeon Gen7 mid bin)
                                #  * 0.97 optics * 0.95 mismatch/curvature
                                #  * 0.99 wiring * 0.99 MPPT (Elmar 98.1-99.4 %)
                                #  * 0.98 soiling
@@ -57,19 +57,24 @@ class Car_coeffs:
                                # Not limiting: climbing needs 9.1 % gradient
                                # headroom at 72.5 km/h, steepest stages are below.
 
-    v1_coeff: float = 10.03    # W/(m/s), rolling: Crr * m * g / eta
+    v1_coeff: float = 12.74    # was 10.03 -> recalculated with data day 3
+                               # W/(m/s), rolling: Crr * m * g / eta
                                #   = 0.004 * 230 * 9.81 / 0.90 = 10.028
                                # Crr = 0.004 is GUESSED, no published value for
                                # the Bridgestone RA01AZ.  Only free number left.
     v2_coeff: float = 0.0      # no physical counterpart (power ~ v²)
-    v3_coeff: float = 0.1415    # Anker 14 Wh/km bei 60 km/h:
-                                 #   (14*3.6 - 18/16.667 - 10.028) / 16.667^2
-                                 #   = 39.292 / 277.78
-                                 # implizites CdA = 0.1415*0.90*2/1.02 = 0.250 m2
-                                 # Der Anker ist ein ERINNERTER Wert, keine Messung.
-                                 # 0.250 m2 ist fuer diese Klasse hoch (typisch
-                                 # 0.10-0.15), also bewusst pessimistisch. Die
-                                 # Unsicherheit ist eine Groessenordnung, kein Prozent.
+    v3_coeff = 0.1797           # war 0.1415. CdA wirksam 0.317 m2
+                                # Gemessen auf day3_route2, 99.7 km, zusammen mit
+                                # wind_height_factor = 0.65. Die beiden sind aus
+                                # dieser Fahrt NICHT trennbar (Kurs konstant 190°).
+                                # v3_coeff: float = 0.1415    # Anker 14 Wh/km bei 60 km/h:
+                                #   (14*3.6 - 18/16.667 - 10.028) / 16.667^2
+                                #   = 39.292 / 277.78
+                                # implizites CdA = 0.1415*0.90*2/1.02 = 0.250 m2
+                                # Der Anker ist ein ERINNERTER Wert, keine Messung.
+                                # 0.250 m2 ist fuer diese Klasse hoch (typisch
+                                # 0.10-0.15), also bewusst pessimistisch. Die
+                                # Unsicherheit ist eine Groessenordnung, kein Prozent.
     v4_coeff: float = 0.0      # no physical counterpart (power ~ airspeed⁴)
     vu_coeff: float = 2507     # J per metre climbed: m * g / eta
                                #   = 230 * 9.81 / 0.90 = 2507.0

@@ -153,11 +153,16 @@ einzeln, Ertrag seit Planstart gemessen gegen Prognose.
 Ziel mit Plan- und erwarteter Zeit. Das Ziel wird rot, wenn die erwartete
 Ankunft nach der Deadline liegt.
 
+**Loop wählen (nur bei Plänen mit Loops).** Unter der Haltebox: welcher
+Durchgang gerade gefahren wird und ob **Hinweg** oder **Rückweg**. Die Zeile
+darüber zeigt, was die Erkennung meint; die Auswahl folgt ihr automatisch,
+solange niemand das Feld angefasst hat. Siehe „Loops“ weiter unten.
+
 **Eingriffe.** Position von Hand setzen (GPS tot oder Umweg): hält die
 Position fest, bis **wieder GPS** gedrückt wird. Der nächste Fix wird dann
-in einem Fenster von ±10 km um die Handposition gesucht — so lässt sich auch
-ein falsch erkannter Loop-Durchgang korrigieren („wir sind in Loop 3, nicht
-in Loop 2“: km des dritten Durchgangs eintippen, wieder GPS). **Anker
+in einem Fenster von ±10 km um die Handposition gesucht. Für einen falsch
+erkannten Loop ist die Loop-Auswahl der bessere Weg — sie hält nichts fest.
+**Anker
 (Stand)**: Energiezähler auf die Ruhespannung setzen, nur nach einigen
 Minuten Stillstand — unter Last wird er verweigert. Dazu die
 **GPS-Geräteauswahl** (siehe unten) und, nur im Simulationsmodus, der
@@ -266,6 +271,109 @@ Hauptzahl und die Spannung die Plausibilitätsprüfung.
 
 ---
 
+## Loops: Durchgang und Hin-/Rückweg
+
+Ein Loop wird hin und zurück über dieselbe Strasse gefahren — `inputs.py`
+baut ihn als Hinweg plus denselben Hinweg rückwärts, ohne den Wendepunkt
+doppelt zu zählen. Damit teilen sich **Hin- und Rückweg jede Koordinate**,
+und jeder Durchgang teilt sie mit jedem anderen. Ein GPS-Fix allein kann
+also weder sagen, in welchem Durchgang das Auto ist, noch in welcher
+Hälfte. Nur die km-Achse des Plans kann das, weil sie der **abgewickelte
+Tag** ist; die Projektion trägt die Antwort vom vorherigen Fix weiter.
+
+Genau deshalb braucht es die Korrektur von Hand: ist die Fortschreibung
+einmal verrutscht — Plan mitten im Loop geladen, GPS-Loch an der Wende,
+ein Umweg —, bleibt sie es für den Rest des Tages, und Zeitplan, ETAs und
+der ganze Energievergleich verrutschen mit. Einmal gemessen: km 90.7 statt
+22.8 und damit −138 Minuten Zeitplan.
+
+**Bedienung:** Durchgang im Auswahlfeld wählen, dann **Hinweg** oder
+**Rückweg** drücken. Unter den Knöpfen steht, wo die Wende liegt und
+welcher Loopstopp den Durchgang abschliesst.
+
+Was dabei passiert: der aktuelle GPS-Fix wird **in das genannte
+Halbstück** projiziert (`after_km` = Anfang, `window_km` = Länge der
+Hälfte), und das Ergebnis ist die neue Position. Die Position wird dabei
+**nicht festgehalten** — anders als „Position von Hand“. Das GPS übernimmt
+sofort wieder und sucht ab dem korrigierten Kilometer weiter, das Auto
+fährt von selbst über die Wende in den Rückweg.
+
+Liegt der Fix mehr als 1.5 km neben dem gewählten Halbstück, wird die
+Eingabe trotzdem ausgeführt — der Grund für die Korrektur kann ja gerade
+ein totes GPS sein —, aber die Seite fragt nach, ob der Loop stimmt, und
+die Notiz hält den Abstand fest.
+
+Ein Rest-Loop („Loop (laufend, Rest)“, wenn der Plan mitten im Loop
+gerechnet wurde) kann ganz aus Rückweg bestehen. Die Wende wird deshalb
+nicht als Mitte angenommen, sondern aus den Koordinaten gelesen: der vom
+Anfang des Abschnitts am weitesten entfernte Knoten. Wo eine Hälfte nicht
+existiert, ist ihr Knopf gesperrt.
+
+---
+
+## Halte: zu früh angekommen
+
+Ein Halt gilt **im Stand ohne Zeitfenster**. Während der Fahrt zählt er ab
+zwei Minuten vor der Planankunft bis zur Planabfahrt; steht das Auto aber
+am Kilometer eines Halts, dann ist es dort — unabhängig von der Uhr.
+
+Das war zuerst nur nach oben so (zwanzig Minuten zu spät am Kontrollstopp,
+und die Anzeige fiel auf „fährt“ zurück). Nach unten fehlte es, und dort
+trifft es vor allem die Loops: ein Loopstopp dauert fünf Minuten, drei
+Minuten zu früh sind normal. Gemessen am Testplan: sechs Minuten zu früh am
+Loopstopp 1 — `at_stop` war `None`, also keine Haltebox, kein „weiter ab“,
+und eine bestätigte Ankunft liess sich nicht einmal einem Halt zuordnen.
+
+Jetzt gilt am Loopstopp dasselbe wie am Kontrollstopp: Ankunft aus dem
+Geschwindigkeitssignal oder **bestätigt** (`Stopp jetzt` / `nachtragen`),
+**weiter ab** = Ankunft + 5 min Reglement, und die ETAs rechnen weiter mit
+den 8 Minuten, die der Plan für Ein- und Aussteigen budgetiert.
+
+---
+
+## Vorzeichen und Plausibilität der Leistung
+
+**Vorzeichen — an den Daten vom 12.09. geprüft, beide stimmen:**
+
+| Frage | Messung | Ergebnis |
+|---|---|---|
+| Ist Entladen negativ? | Fahrt > 30 km/h: `batteryCurrent` Mittel **−5.83 A** | ja, `i_batt_discharge_positive=False` ✓ |
+| Sieht der Shunt schon den Netto-Strom? | Stillstand mit Sonne (21 Zeilen): `batteryCurrent` **+4.06 A** gegen `pvCurrent` **+4.37 A**, Verhältnis 0.93 | ja, `i_batt_is_net=True` ✓ (die fehlenden 7 % sind der Aux-Verbrauch, der nie in den Pack geht) |
+
+Damit steht `net_verified=True` in `TelemetrySigns` — der Standversuch ist
+gelaufen, die Warnung beim Start ist weg.
+
+**Was tatsächlich falsch war:** `v_pack` und `i_batt` hatten seit jeher ein
+Plausibilitätsfenster, `p_solar` nicht. Ein einziges Schrott-Sample aus dem
+MPPT-Frame (im Log vom 12.09. **−357 W auf MPPT 4**, in einem Kanal, der
+sonst 0…256 W liefert) landet damit ungeprüft im Integral, und das Integral
+wird von nichts später neu verankert. Mit einem künstlichen 1.1e31-W-Sample
+lässt sich die Anzeige aus den Screenshots exakt reproduzieren: Sonne
+6.111e+27 Wh, Tagesende −1.719e+26 Wh. Nicht das Vorzeichen — der fehlende
+Filter.
+
+Jetzt gilt pro MPPT-Kanal:
+
+| Gate | Wert | Warum |
+|---|---|---|
+| `p_mppt_max` | 600 W je Kanal | Array ≈ 1.2 kW auf vier MPPTs, gemessenes Maximum 256 W je Kanal — 600 W ist schon doppelt so viel, wie ein Kanal kann |
+| `p_mppt_min` | −100 W je Kanal | ein Wandler, der senkt, ist physikalisch klein; −357 W ist ein kaputter Frame |
+| `max_bridge_s` | 1800 s | ein Trapez über ein Loch von Stunden ist keine Überbrückung, sondern eine Erfindung |
+
+Ein unplausibler Kanal wird **verworfen, nicht das ganze Sample**: die
+Batterieseite dieses Samples ist eine gültige Messung, und weil der Shunt
+den Nettostrom sieht, geht `p_solar` ohnehin nur in die Aufteilung
+Sonne/Verbrauch ein, nicht in den Packverbrauch. Eine Lücke über
+`max_bridge_s` wird gar nicht integriert — die Strecke fehlt dann ehrlich
+in der Zählung, statt sie zu erfinden. Beides steht auf der Seite in der
+Zeile **Daten** (`… MPPT-Werte unplausibel`, `… Abbruch (n min NICHT
+gezählt)`); nach einem Abbruch im Stand neu verankern.
+
+Bei einer Lücke über `max_gap_s` (30 s) wird weiterhin überbrückt und die
+Menge als *Wh überbrückt* ausgewiesen — das ist die Grauzone dazwischen.
+
+---
+
 ## Testen ohne Auto
 
 Zwei Wege.
@@ -313,10 +421,21 @@ python test_live_offline.py
   ein bei 0 hängendes Geschwindigkeitssignal soll die Position nicht
   festnageln.
 - Am Kontrollstopp und an jedem Loopstopp liegen mehrere Loop-Durchgänge auf
-  **demselben Punkt**. Die Zuordnung kommt deshalb aus der Historie
+  **demselben Punkt**, und Hin- und Rückweg eines Durchgangs liegen auf
+  derselben Strasse. Die Zuordnung kommt deshalb aus der Historie
   (sequenzielle Projektion), nicht aus einer Einzelmessung. Steht sie
-  trotzdem falsch, hilft „Position von Hand“ mit dem km des richtigen
-  Durchgangs.
+  trotzdem falsch: **Loop wählen** unter der Haltebox (Durchgang +
+  Hinweg/Rückweg) — siehe Abschnitt „Loops“.
+- **Behoben (13.09.):** `Timestamp.isoformat()` lässt den Bruchteil weg,
+  wenn er null ist. Das letzte Leg wird auf die Deadline geklemmt — eine
+  runde Zeit —, also enthält jeder Plan, der den Tag ausnutzt, genau eine
+  solche Zeile, während alle anderen Nanosekunden tragen. pandas rät das
+  Format aus dem **ersten** Element und wendet es strikt an, und der Plan
+  liess sich gar nicht mehr laden (`time data "…T15:00:00+00:00" doesn't
+  match format "%Y-%m-%dT%H:%M:%S.%f%z"`). Alles Einlesen von ISO-Strings
+  läuft jetzt über `planfile._utc()` mit `format="ISO8601"`; dasselbe in
+  `ser_client.parse_range_json()`, wo eine Telemetrie-Sekunde ohne
+  Bruchteil den ganzen Abruf werfen liess.
 - Die Seite braucht kein Internet — kein CDN, alles in einer Datei.
 - Die Plandatei enthält die Uhrzeit, mit der `point_strategy.py` gerechnet
   hat (`--time`). Liegt sie in der Zukunft, wird nichts nachgeladen und die

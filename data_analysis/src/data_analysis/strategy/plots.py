@@ -212,7 +212,9 @@ def soc_plot(opt, state, batt, plt):
     ax.legend(loc="lower left", fontsize=8, framealpha=0.9)
     ax.grid(alpha=0.25)
     ax.set_title(f"Tag {state.day} · {opt.n_loops} Loop(s) · {opt.km:.1f} km "
-                 f"· Ø {opt.avg_kmh:.1f} km/h", loc="left", fontsize=10)
+                 f"· Ø {opt.avg_kmh:.1f} km/h"
+                 + (" · Panel flach" if getattr(opt, "panel_flat", False)
+                    else ""), loc="left", fontsize=10)
 
     # --- instantaneous power. Not the same information as the cumulative
     # below: the cumulative says how the day adds up, this says what the
@@ -369,9 +371,17 @@ def _power_over_time(axp, tr):
     _tag(axp.plot(h, p, lw=0, alpha=0, label="_PV-Leistung"))
     axp.stairs(p, edges, color="tab:orange", lw=1.2, alpha=0.85,
                label="PV-Leistung, flach (fahrend)")
+    # The standing label has to match the premise: with a flat panel the
+    # blue band is NOT a tracking band, and a legend that says otherwise
+    # invites reading a gain out of it that is not there. Taken from the
+    # trace and not from the DayOption, which is not in scope here - and
+    # the trace is the better source anyway: a day whose only halt is a
+    # driver change has no tracked row either, and is equally flat.
+    any_tracked = bool((tr["panel"].to_numpy() == "tracked").any())
     axp.stairs(np.where(is_stop, p, np.nan), edges, fill=True,
                color="tab:blue", alpha=0.35,
-               label="PV-Leistung, nachgefuehrt (stehend)")
+               label=("PV-Leistung, nachgefuehrt (stehend)" if any_tracked
+                      else "PV-Leistung, flach (stehend)"))
 
     # What the tracking is worth, compared AT THE SAME TIME OF DAY.
     # Comparing the mean over the stops against the mean over the whole
@@ -495,7 +505,9 @@ def morning_plot(mc, state, batt, plt):
     axp.fill_between(h, 0, df["p_solar"], color="tab:orange", alpha=0.18,
                      lw=0)
     _tag(axp.plot(h, df["p_solar"], color="tab:orange", lw=1.2,
-                  label="PV-Leistung, nachgefuehrt"))
+                  label=("PV-Leistung, nachgefuehrt"
+                         if getattr(mc, "tracked", True)
+                         else "PV-Leistung, flach")))
     axp.set_ylabel("PV-Leistung [W]", color="tab:orange", fontsize=9)
     axp.tick_params(axis="y", colors="tab:orange", labelsize=8)
     axp._y_squeeze = 2.6
